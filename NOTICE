@@ -1,0 +1,25 @@
+HengLang / HENG
+Copyright 2026 tlkppm and HengLang contributors.
+
+English
+
+The original project source code, tests, examples, benchmarks, configuration,
+and documentation distributed in this repository are made available under
+Apache License 2.0 unless a file explicitly states a different license.
+The complete license is provided in LICENSE.
+
+This notice is informational and does not modify the license. Third-party
+software retains its own copyright and license terms. Downloaded toolchains,
+build caches, generated executables, models, and datasets are not included
+in this source distribution. No trained model or dataset license is granted
+by this notice. See THIRD_PARTY_NOTICES.md and LEGAL.md for scope and caveats.
+
+简体中文
+
+本仓库发布的项目原创源码、测试、示例、基准、配置和文档采用 Apache-2.0，
+但文件明确声明其他许可证的情况除外。完整许可证见 LICENSE。
+
+本声明仅提供归属信息，不修改许可证。第三方软件保留各自的版权与许可条款。
+本次源码发布不包含下载的工具链、构建缓存、生成的可执行文件、模型或数据集。
+本声明不授予任何已训练模型或数据集的许可。范围及注意事项参见
+THIRD_PARTY_NOTICES.md 和 LEGAL.md。

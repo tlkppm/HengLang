@@ -1,0 +1,11 @@
+import "../heng/heng.heng";
+fn main() -> void {
+    let tape = ag_tape();
+    let input = ag_variable(tape, tensor([1.0, 2.0, 3.0], [3]), true);
+    let output = ag_sum_all(tape, ag_mul(tape, input, input));
+    assert_close(ag_value(tape, output), full([], 14.0), 0.0, 0.0);
+    ag_backward(tape, output, ones([]), false);
+    assert_close(ag_grad(tape, input), tensor([2.0, 4.0, 6.0], [3]), 0.0, 0.0);
+    print(ag_value(tape, output));
+    print(ag_grad(tape, input));
+}

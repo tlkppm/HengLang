@@ -1,0 +1,190 @@
+import "nn/modules.heng";
+import "optim/optimizers.heng";
+
+struct StateBundle {
+    tensors:List<Tensor>,
+    ints:List<i64>,
+    floats:List<f64>
+}
+
+fn state_collect_modules(module:NNModule,modules:List<NNModule>) {
+    push(modules,module);
+    for child in module.children { state_collect_modules(child,modules); }
+}
+
+fn state_modules(module:NNModule)->List<NNModule> {
+    let modules:List<NNModule>=[];
+    state_collect_modules(module,modules);
+    return modules;
+}
+
+fn state_parameter_position(parameters:List<i64>,parameter:i64)->i64 {
+    var index:i64=0;
+    for value in parameters {
+        if value==parameter { return index; }
+        index=index+1;
+    }
+    assert(false,"优化器或子模块参数未注册到模型");
+    return -1;
+}
+
+fn state_pack(tape:AGTape,model:NNModule,optimizer:OPTOptimizer)->StateBundle {
+    let parameters=nn_parameters(model);
+    let modules=state_modules(model);
+    let tensors:List<Tensor>=[];
+    var buffer_count:i64=0;
+    for parameter in parameters { push(tensors,clone(ag_value(tape,parameter))); }
+    for module in modules {
+        for buffer in module.buffers { push(tensors,clone(buffer)); buffer_count=buffer_count+1; }
+    }
+    for value in optimizer.first { push(tensors,clone(value)); }
+    for value in optimizer.second { push(tensors,clone(value)); }
+    for value in optimizer.third { push(tensors,clone(value)); }
+    var nesterov:i64=0;
+    var centered:i64=0;
+    if optimizer.nesterov { nesterov=1; }
+    if optimizer.centered { centered=1; }
+    let ints:List<i64>=[1212501583,1,len(parameters),buffer_count,len(optimizer.parameters),optimizer.kind,optimizer.steps,rng_state(),nesterov,centered,len(modules)];
+    let floats:List<f64>=[optimizer.learning_rate,optimizer.beta1,optimizer.beta2,optimizer.epsilon,optimizer.weight_decay,optimizer.momentum];
+    for parameter in optimizer.parameters { push(ints,state_parameter_position(parameters,parameter)); }
+    for module in modules {
+        push(ints,module.kind);
+        var training:i64=0;
+        if module.training { training=1; }
+        push(ints,training);
+        push(ints,len(module.config));
+        push(ints,len(module.buffers));
+        push(ints,len(module.parameters));
+        push(ints,len(module.children));
+        push(ints,len(module.scalars));
+        for value in module.config { push(ints,value); }
+        for parameter in module.parameters { push(ints,state_parameter_position(parameters,parameter)); }
+        for value in module.scalars { push(floats,value); }
+    }
+    return StateBundle {tensors:tensors,ints:ints,floats:floats};
+}
+
+fn state_save_checkpoint(path:str,tape:AGTape,model:NNModule,optimizer:OPTOptimizer) {
+    let bundle=state_pack(tape,model,optimizer);
+    state_save(path,bundle.tensors,bundle.ints,bundle.floats);
+}
+
+fn state_need(position:i64,count:i64,total:i64) {
+    assert(position>=0 && count>=0 && position<=total && count<=total-position,"状态文件字段不完整");
+}
+
+fn state_validate(tape:AGTape,model:NNModule,optimizer:OPTOptimizer,bundle:StateBundle) {
+    let ints=bundle.ints;
+    let floats=bundle.floats;
+    let tensors=bundle.tensors;
+    state_need(0,11,len(ints));
+    state_need(0,6,len(floats));
+    assert(ints[0]==1212501583 && ints[1]==1,"状态文件框架标识或版本不匹配");
+    let parameters=nn_parameters(model);
+    let modules=state_modules(model);
+    assert(ints[2]==len(parameters) && ints[4]==len(optimizer.parameters) && ints[10]==len(modules),"状态文件参数或模块数量不匹配");
+    assert(ints[5]==optimizer.kind && ints[6]>=0,"状态文件优化器类型或步数无效");
+    assert(ints[7]!=0,"随机数状态不能为零");
+    assert((ints[8]==0 || ints[8]==1) && (ints[9]==0 || ints[9]==1),"状态文件优化器布尔字段无效");
+    for value in floats { assert(value==value && value>=-1.0e308 && value<=1.0e308,"状态文件包含非有限浮点值"); }
+    assert(floats[0]>=0.0 && floats[1]>=0.0 && floats[1]<1.0 && floats[2]>=0.0 && floats[2]<1.0 && floats[3]>0.0 && floats[4]>=0.0 && floats[5]>=0.0 && floats[5]<1.0,"状态文件优化器超参数无效");
+    assert(ints[8]==0 || floats[5]>0.0,"状态文件 Nesterov 动量无效");
+    var buffer_count:i64=0;
+    for module in modules { buffer_count=buffer_count+len(module.buffers); }
+    assert(ints[3]==buffer_count,"状态文件缓冲张量数量不匹配");
+    assert(len(tensors)==len(parameters)+buffer_count+3*len(optimizer.parameters),"状态文件张量数量不匹配");
+    var tensor_index:i64=0;
+    for parameter in parameters {
+        assert(ag_same_shape(shape(tensors[tensor_index]),shape(ag_value(tape,parameter))) && dtype(tensors[tensor_index])==dtype(ag_value(tape,parameter)),"状态文件参数形状或类型不匹配");
+        tensor_index=tensor_index+1;
+    }
+    for module in modules {
+        for buffer in module.buffers {
+            assert(ag_same_shape(shape(tensors[tensor_index]),shape(buffer)) && dtype(tensors[tensor_index])==dtype(buffer),"状态文件模块缓冲形状或类型不匹配");
+            tensor_index=tensor_index+1;
+        }
+    }
+    var group:i64=0;
+    while group<3 {
+        for parameter in optimizer.parameters {
+            assert(ag_same_shape(shape(tensors[tensor_index]),shape(ag_value(tape,parameter))) && dtype(tensors[tensor_index])==dtype(ag_value(tape,parameter)),"状态文件优化器张量形状或类型不匹配");
+            tensor_index=tensor_index+1;
+        }
+        group=group+1;
+    }
+    var position:i64=11;
+    state_need(position,len(optimizer.parameters),len(ints));
+    for parameter in optimizer.parameters {
+        assert(ints[position]==state_parameter_position(parameters,parameter),"状态文件优化器参数映射不匹配");
+        position=position+1;
+    }
+    var float_position:i64=6;
+    for module in modules {
+        state_need(position,7,len(ints));
+        assert(ints[position]==module.kind && (ints[position+1]==0 || ints[position+1]==1),"状态文件模块类型或模式无效");
+        assert(ints[position+2]==len(module.config) && ints[position+3]==len(module.buffers) && ints[position+4]==len(module.parameters) && ints[position+5]==len(module.children) && ints[position+6]==len(module.scalars),"状态文件模块结构不匹配");
+        position=position+7;
+        state_need(position,len(module.config)+len(module.parameters),len(ints));
+        var config_index:i64=0;
+        for expected in module.config {
+            if module.kind==11 && config_index==1 { assert(ints[position]>=0,"BatchNorm 计数无效"); }
+            else { assert(ints[position]==expected,"状态文件模块配置不匹配"); }
+            position=position+1;
+            config_index=config_index+1;
+        }
+        for parameter in module.parameters {
+            assert(ints[position]==state_parameter_position(parameters,parameter),"状态文件共享参数映射不匹配");
+            position=position+1;
+        }
+        state_need(float_position,len(module.scalars),len(floats));
+        if module.kind==10 || module.kind==11 { assert(floats[float_position]>0.0,"归一化 epsilon 无效"); }
+        if module.kind==11 { assert(floats[float_position+1]>=0.0 && floats[float_position+1]<=1.0,"BatchNorm 动量无效"); }
+        if module.kind==12 { assert(floats[float_position]>=0.0 && floats[float_position]<1.0,"Dropout 概率无效"); }
+        float_position=float_position+len(module.scalars);
+    }
+    assert(position==len(ints) && float_position==len(floats),"状态文件含多余字段");
+}
+
+fn state_unpack(tape:AGTape,model:NNModule,optimizer:OPTOptimizer,bundle:StateBundle) {
+    state_validate(tape,model,optimizer,bundle);
+    let parameters=nn_parameters(model);
+    let modules=state_modules(model);
+    var tensor_index:i64=0;
+    for parameter in parameters { ag_assign(tape,parameter,clone(bundle.tensors[tensor_index])); tensor_index=tensor_index+1; }
+    for module in modules {
+        var index:i64=0;
+        while index<len(module.buffers) { module.buffers[index]=clone(bundle.tensors[tensor_index]); tensor_index=tensor_index+1; index=index+1; }
+    }
+    var index:i64=0;
+    while index<len(optimizer.parameters) { optimizer.first[index]=clone(bundle.tensors[tensor_index]); tensor_index=tensor_index+1; index=index+1; }
+    index=0;
+    while index<len(optimizer.parameters) { optimizer.second[index]=clone(bundle.tensors[tensor_index]); tensor_index=tensor_index+1; index=index+1; }
+    index=0;
+    while index<len(optimizer.parameters) { optimizer.third[index]=clone(bundle.tensors[tensor_index]); tensor_index=tensor_index+1; index=index+1; }
+    optimizer.steps=bundle.ints[6];
+    optimizer.nesterov=bundle.ints[8]==1;
+    optimizer.centered=bundle.ints[9]==1;
+    optimizer.learning_rate=bundle.floats[0];
+    optimizer.beta1=bundle.floats[1];
+    optimizer.beta2=bundle.floats[2];
+    optimizer.epsilon=bundle.floats[3];
+    optimizer.weight_decay=bundle.floats[4];
+    optimizer.momentum=bundle.floats[5];
+    var position:i64=11+len(optimizer.parameters);
+    var float_position:i64=6;
+    for module in modules {
+        module.training=bundle.ints[position+1]==1;
+        position=position+7;
+        index=0;
+        while index<len(module.config) { module.config[index]=bundle.ints[position]; position=position+1; index=index+1; }
+        position=position+len(module.parameters);
+        index=0;
+        while index<len(module.scalars) { module.scalars[index]=bundle.floats[float_position]; float_position=float_position+1; index=index+1; }
+    }
+    rng_restore(bundle.ints[7]);
+}
+
+fn state_load_checkpoint(path:str,tape:AGTape,model:NNModule,optimizer:OPTOptimizer) {
+    let bundle=StateBundle {tensors:state_tensors(path),ints:state_ints(path),floats:state_floats(path)};
+    state_unpack(tape,model,optimizer,bundle);
+}

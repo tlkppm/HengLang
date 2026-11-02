@@ -1,0 +1,9 @@
+import "../../heng/ops.heng";
+
+fn main() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,ones([2]),true);
+    let output=ag_sum_all(tape,ag_pow(tape,input,2.0));
+    set(ag_value(tape,input),[0],3.0);
+    ag_backward(tape,output,ones([]),false);
+}

@@ -1,0 +1,126 @@
+import "autograd.heng";
+
+fn ag_add(tape:AGTape,left:i64,right:i64)->i64 {
+    return ag_record(tape,add(ag_value(tape,left),ag_value(tape,right)),[left,right],1,[],[],0.0);
+}
+fn ag_sub(tape:AGTape,left:i64,right:i64)->i64 {
+    return ag_record(tape,sub(ag_value(tape,left),ag_value(tape,right)),[left,right],2,[],[],0.0);
+}
+fn ag_mul(tape:AGTape,left:i64,right:i64)->i64 {
+    return ag_record(tape,mul(ag_value(tape,left),ag_value(tape,right)),[left,right],3,[],[],0.0);
+}
+fn ag_div(tape:AGTape,left:i64,right:i64)->i64 {
+    return ag_record(tape,div(ag_value(tape,left),ag_value(tape,right)),[left,right],4,[],[],0.0);
+}
+fn ag_scale(tape:AGTape,input:i64,value:f64)->i64 {
+    return ag_record(tape,scale(ag_value(tape,input),value),[input],5,[],[],value);
+}
+fn ag_pow(tape:AGTape,input:i64,value:f64)->i64 {
+    return ag_record(tape,pow(ag_value(tape,input),value),[input],6,[],[],value);
+}
+fn ag_exp(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,exp(ag_value(tape,input)),[input],7,[],[],0.0);
+}
+fn ag_log(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,log(ag_value(tape,input)),[input],8,[],[],0.0);
+}
+fn ag_sqrt(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,sqrt(ag_value(tape,input)),[input],9,[],[],0.0);
+}
+fn ag_tanh(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,tanh(ag_value(tape,input)),[input],10,[],[],0.0);
+}
+fn ag_sigmoid(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,sigmoid(ag_value(tape,input)),[input],11,[],[],0.0);
+}
+fn ag_relu(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,relu(ag_value(tape,input)),[input],12,[],[],0.0);
+}
+fn ag_abs(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,abs(ag_value(tape,input)),[input],13,[],[],0.0);
+}
+fn ag_reshape(tape:AGTape,input:i64,dims:List<i64>)->i64 {
+    return ag_record(tape,reshape(ag_value(tape,input),dims),[input],14,[],dims,0.0);
+}
+fn ag_transpose(tape:AGTape,input:i64,permutation:List<i64>)->i64 {
+    assert(len(permutation)==rank(ag_value(tape,input)),"置换维度数量错误");
+    let normalized:List<i64>=[];
+    for axis in permutation {
+        let value=ag_axis(axis,len(permutation));
+        for previous in normalized { assert(previous!=value,"置换轴重复"); }
+        push(normalized,value);
+    }
+    return ag_record(tape,transpose(ag_value(tape,input),normalized),[input],15,normalized,[],0.0);
+}
+fn ag_sum(tape:AGTape,input:i64,axis:i64,keep:bool)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    var keep_value:i64=0;
+    if keep { keep_value=1; }
+    return ag_record(tape,sum(ag_value(tape,input),normalized,keep),[input],16,[normalized,keep_value],[],0.0);
+}
+fn ag_sum_all(tape:AGTape,input:i64)->i64 {
+    return ag_record(tape,sum_all(ag_value(tape,input)),[input],17,[],[],0.0);
+}
+fn ag_mean(tape:AGTape,input:i64,axis:i64,keep:bool)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    assert(shape(ag_value(tape,input))[normalized]>0,"空轴不能求平均");
+    var keep_value:i64=0;
+    if keep { keep_value=1; }
+    return ag_record(tape,mean(ag_value(tape,input),normalized,keep),[input],18,[normalized,keep_value],[],0.0);
+}
+fn ag_mean_all(tape:AGTape,input:i64)->i64 {
+    let count=numel(ag_value(tape,input));
+    assert(count>0,"空张量不能求平均");
+    return ag_scale(tape,ag_sum_all(tape,input),1.0/f64(count));
+}
+fn ag_matmul(tape:AGTape,left:i64,right:i64)->i64 {
+    assert(rank(ag_value(tape,left))>=2 && rank(ag_value(tape,right))>=2,"可微矩阵乘法要求至少二维");
+    return ag_record(tape,matmul(ag_value(tape,left),ag_value(tape,right)),[left,right],19,[],[],0.0);
+}
+fn ag_softmax(tape:AGTape,input:i64,axis:i64)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    return ag_record(tape,softmax(ag_value(tape,input),normalized),[input],20,[normalized],[],0.0);
+}
+fn ag_broadcast(tape:AGTape,input:i64,dims:List<i64>)->i64 {
+    return ag_record(tape,broadcast_to(ag_value(tape,input),dims),[input],21,[],dims,0.0);
+}
+fn ag_reduce_to_shape(tape:AGTape,input:i64,dims:List<i64>)->i64 {
+    return ag_record(tape,reduce_to_shape(ag_value(tape,input),dims),[input],22,[],dims,0.0);
+}
+fn ag_slice(tape:AGTape,input:i64,axis:i64,start:i64,stop:i64,step:i64)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    assert(start>=0 && stop>=start && stop<=shape(ag_value(tape,input))[normalized] && step>0,"可微切片要求有效正步长范围");
+    return ag_record(tape,slice(ag_value(tape,input),normalized,start,stop,step),[input],23,[normalized,start,stop,step],[],0.0);
+}
+fn ag_concat(tape:AGTape,left:i64,right:i64,axis:i64)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,left)));
+    return ag_record(tape,concat(ag_value(tape,left),ag_value(tape,right),normalized),[left,right],24,[normalized],[],0.0);
+}
+fn ag_gather(tape:AGTape,input:i64,indices:List<i64>,axis:i64)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    let metadata:List<i64>=[normalized];
+    let dimension=shape(ag_value(tape,input))[normalized];
+    for index in indices { assert(index>=0 && index<dimension,"索引超出范围"); push(metadata,index); }
+    return ag_record(tape,gather(ag_value(tape,input),indices,normalized),[input],25,metadata,[],0.0);
+}
+fn ag_unfold2d(tape:AGTape,input:i64,kh:i64,kw:i64,stride:i64,padding:i64)->i64 {
+    assert(rank(ag_value(tape,input))==4 && kh>0 && kw>0 && stride>0 && padding>=0,"unfold2d 参数错误");
+    return ag_record(tape,unfold2d(ag_value(tape,input),kh,kw,stride,padding),[input],26,[kh,kw,stride,padding],[],0.0);
+}
+fn ag_fold2d(tape:AGTape,input:i64,dims:List<i64>,kh:i64,kw:i64,stride:i64,padding:i64)->i64 {
+    assert(len(dims)==4 && kh>0 && kw>0 && stride>0 && padding>=0,"fold2d 参数错误");
+    return ag_record(tape,fold2d(ag_value(tape,input),dims,kh,kw,stride,padding),[input],27,[kh,kw,stride,padding],dims,0.0);
+}
+fn ag_max(tape:AGTape,input:i64,axis:i64,keep:bool)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    assert(shape(ag_value(tape,input))[normalized]>0,"空轴不能求最大值");
+    var keep_value:i64=0;
+    if keep { keep_value=1; }
+    return ag_record(tape,max(ag_value(tape,input),normalized,keep),[input],28,[normalized,keep_value],[],0.0);
+}
+fn ag_log_softmax(tape:AGTape,input:i64,axis:i64)->i64 {
+    let normalized=ag_axis(axis,rank(ag_value(tape,input)));
+    let maximum=ag_constant(tape,max(ag_value(tape,input),normalized,true));
+    let shifted=ag_sub(tape,input,maximum);
+    return ag_sub(tape,shifted,ag_log(tape,ag_sum(tape,ag_exp(tape,shifted),normalized,true)));
+}

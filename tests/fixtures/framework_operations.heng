@@ -1,0 +1,69 @@
+import "../../heng/ops.heng";
+
+fn ag_fixture_operation(tape:AGTape,kind:i64,input:i64,other:i64)->i64 {
+    if kind==1 { return ag_add(tape,input,other); }
+    if kind==2 { return ag_sub(tape,input,other); }
+    if kind==3 { return ag_mul(tape,input,other); }
+    if kind==4 { return ag_div(tape,input,other); }
+    if kind==5 { return ag_scale(tape,input,1.7); }
+    if kind==6 { return ag_pow(tape,input,2.3); }
+    if kind==7 { return ag_exp(tape,input); }
+    if kind==8 { return ag_log(tape,input); }
+    if kind==9 { return ag_sqrt(tape,input); }
+    if kind==10 { return ag_tanh(tape,input); }
+    if kind==11 { return ag_sigmoid(tape,input); }
+    if kind==12 { return ag_relu(tape,input); }
+    if kind==13 { return ag_abs(tape,input); }
+    if kind==14 { return ag_reshape(tape,input,[4]); }
+    if kind==15 { return ag_transpose(tape,input,[1,0]); }
+    if kind==16 { return ag_sum(tape,input,1,false); }
+    if kind==17 { return ag_sum_all(tape,input); }
+    if kind==18 { return ag_mean(tape,input,1,false); }
+    if kind==19 { return ag_matmul(tape,input,other); }
+    if kind==20 { return ag_softmax(tape,input,1); }
+    if kind==21 { return ag_broadcast(tape,input,[2,2,2]); }
+    if kind==22 { return ag_reduce_to_shape(tape,input,[1,2]); }
+    if kind==23 { return ag_slice(tape,input,1,0,2,2); }
+    if kind==24 { return ag_concat(tape,input,other,0); }
+    if kind==25 { return ag_gather(tape,input,[1,0,1],0); }
+    if kind==26 { return ag_unfold2d(tape,ag_reshape(tape,input,[1,1,2,2]),2,2,1,1); }
+    if kind==27 { return ag_fold2d(tape,ag_reshape(tape,input,[1,4,1]),[1,1,2,2],2,2,1,0); }
+    return ag_max(tape,input,1,false);
+}
+
+fn ag_fixture_numeric(kind:i64,input:Tensor,other:Tensor)->Tensor {
+    let tape=ag_tape();
+    return ag_value(tape,ag_fixture_operation(tape,kind,ag_variable(tape,input,true),ag_variable(tape,other,true)));
+}
+
+fn ag_fixture_derivatives(kind:i64) {
+    let input=tensor([0.4,0.8,1.3,1.7],[2,2]);
+    let other=tensor([1.2,0.4,-0.3,1.5],[2,2]);
+    let direction=tensor([0.3,-0.2,0.5,0.7],[2,2]);
+    let second_direction=tensor([-0.2,0.6,0.1,-0.4],[2,2]);
+    let tape=ag_tape();
+    let left=ag_variable(tape,input,true);
+    let right=ag_variable(tape,other,true);
+    let output=ag_fixture_operation(tape,kind,left,right);
+    let tangent=ag_jvp(tape,output,[left,right],[direction,second_direction]);
+    let epsilon=0.000001;
+    let positive=ag_fixture_numeric(kind,add(input,scale(direction,epsilon)),add(other,scale(second_direction,epsilon)));
+    let negative=ag_fixture_numeric(kind,sub(input,scale(direction,epsilon)),sub(other,scale(second_direction,epsilon)));
+    let numeric=scale(sub(positive,negative),0.5/epsilon);
+    assert_close(tangent,numeric,0.00001,0.00001);
+    let seed_value=reshape(add(arange(numel(ag_value(tape,output))),ones([numel(ag_value(tape,output))])),shape(ag_value(tape,output)));
+    let reverse=ag_vjp(tape,output,seed_value,[left,right],false);
+    let forward_pair=sum_all(mul(tangent,seed_value));
+    let reverse_pair=add(sum_all(mul(reverse[0],direction)),sum_all(mul(reverse[1],second_direction)));
+    assert_close(forward_pair,reverse_pair,0.000001,0.000001);
+}
+
+fn main() {
+    var kind:i64=1;
+    while kind<=28 { ag_fixture_derivatives(kind); kind=kind+1; }
+    let tape=ag_tape();
+    let tied=ag_variable(tape,tensor([2.0,2.0,1.0],[1,3]),true);
+    ag_backward(tape,ag_sum_all(tape,ag_max(tape,tied,1,false)),ones([]),false);
+    assert_close(ag_grad(tape,tied),tensor([0.5,0.5,0.0],[1,3]),0.000000001,0.000000001);
+    print("PASS: 28 类可微操作的有限差分、JVP 与 VJP 对偶验证");
+}

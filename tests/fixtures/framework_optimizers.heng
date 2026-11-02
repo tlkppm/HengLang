@@ -1,0 +1,80 @@
+import "../../heng/heng.heng";
+
+fn opt_fixture_sgd_momentum() {
+    let tape=ag_tape();
+    let parameter=ag_variable(tape,tensor([1.0,-2.0],[2]),true);
+    let optimizer=opt_sgd(tape,[parameter,parameter],0.1,0.0,0.0,false);
+    tape.nodes[parameter].grad=tensor([2.0,-3.0],[2]);
+    opt_step(tape,optimizer);
+    assert_close(ag_value(tape,parameter),tensor([0.8,-1.7],[2]),0.000000001,0.000000001);
+    assert(len(optimizer.parameters)==1,"优化器必须去重共享参数");
+    let momentum_parameter=ag_variable(tape,full([1],1.0),true);
+    let momentum=opt_momentum(tape,[momentum_parameter],0.1,0.5);
+    tape.nodes[momentum_parameter].grad=full([1],2.0);
+    opt_step(tape,momentum);
+    assert_close(ag_value(tape,momentum_parameter),full([1],0.8),0.000000001,0.000000001);
+    tape.nodes[momentum_parameter].grad=full([1],3.0);
+    opt_step(tape,momentum);
+    assert_close(ag_value(tape,momentum_parameter),full([1],0.4),0.000000001,0.000000001);
+    assert_close(momentum.first[0],full([1],4.0),0.000000001,0.000000001);
+    let nesterov_parameter=ag_variable(tape,full([1],1.0),true);
+    let nesterov=opt_sgd(tape,[nesterov_parameter],0.1,0.5,0.0,true);
+    tape.nodes[nesterov_parameter].grad=full([1],2.0);
+    opt_step(tape,nesterov);
+    assert_close(ag_value(tape,nesterov_parameter),full([1],0.7),0.000000001,0.000000001);
+}
+
+fn opt_fixture_adaptive() {
+    let tape=ag_tape();
+    let parameter=ag_variable(tape,full([1],1.0),true);
+    let optimizer=opt_adam(tape,[parameter],0.1,0.9,0.999,0.00000001,0.0);
+    tape.nodes[parameter].grad=full([1],2.0);
+    opt_step(tape,optimizer);
+    assert_close(ag_value(tape,parameter),full([1],1.0-0.2/2.00000001),0.000000001,0.000000001);
+    assert_close(optimizer.first[0],full([1],0.2),0.000000001,0.000000001);
+    assert_close(optimizer.second[0],full([1],0.004),0.000000001,0.000000001);
+    let decoupled=ag_variable(tape,full([1],1.0),true);
+    let adamw=opt_adamw(tape,[decoupled],0.1,0.9,0.999,0.00000001,0.1);
+    tape.nodes[decoupled].grad=full([1],2.0);
+    opt_step(tape,adamw);
+    assert_close(ag_value(tape,decoupled),full([1],0.99-0.2/2.00000001),0.000000001,0.000000001);
+    let rms_parameter=ag_variable(tape,full([1],1.0),true);
+    let rms=opt_rmsprop(tape,[rms_parameter],0.1,0.9,0.00000001,0.0,0.0,false);
+    tape.nodes[rms_parameter].grad=full([1],2.0);
+    opt_step(tape,rms);
+    let expected=sub(ones([1]),div(full([1],0.2),add(sqrt(full([1],0.4)),full([1],0.00000001))));
+    assert_close(ag_value(tape,rms_parameter),expected,0.000000001,0.000000001);
+    let centered_parameter=ag_variable(tape,full([1],1.0),true);
+    let centered=opt_rmsprop(tape,[centered_parameter],0.1,0.9,0.00000001,0.0,0.0,true);
+    tape.nodes[centered_parameter].grad=full([1],2.0);
+    opt_step(tape,centered);
+    let centered_expected=sub(ones([1]),div(full([1],0.2),add(sqrt(full([1],0.36)),full([1],0.00000001))));
+    assert_close(ag_value(tape,centered_parameter),centered_expected,0.000000001,0.000000001);
+}
+
+fn opt_fixture_clipping_schedule() {
+    let tape=ag_tape();
+    let parameter=ag_variable(tape,ones([2]),true);
+    tape.nodes[parameter].grad=tensor([3.0,4.0],[2]);
+    let norm=opt_clip_grad_norm(tape,[parameter,parameter],2.5,0.000000001);
+    assert(norm==5.0,"梯度范数应按去重参数计算");
+    assert_close(ag_grad(tape,parameter),tensor([1.5,2.0],[2]),0.000001,0.000001);
+    opt_clip_grad_value(tape,[parameter],1.0);
+    assert_close(ag_grad(tape,parameter),ones([2]),0.000000001,0.000000001);
+    let optimizer=opt_sgd(tape,[parameter],0.2,0.0,0.0,false);
+    let schedule=opt_step_schedule(optimizer,2,0.5);
+    assert(opt_schedule_step(optimizer,schedule)==0.2,"阶梯调度第一步错误");
+    assert(opt_schedule_step(optimizer,schedule)==0.1,"阶梯调度第二步错误");
+    let linear=opt_linear_schedule(optimizer,2,0.0);
+    assert(opt_schedule_step(optimizer,linear)==0.05,"线性调度第一步错误");
+    assert(opt_schedule_step(optimizer,linear)==0.0,"线性调度第二步错误");
+    opt_zero_grad(tape,optimizer);
+    assert_close(ag_grad(tape,parameter),zeros([2]),0.000000001,0.000000001);
+}
+
+fn main() {
+    opt_fixture_sgd_momentum();
+    opt_fixture_adaptive();
+    opt_fixture_clipping_schedule();
+    print("PASS: SGD、Momentum、Nesterov、Adam、AdamW、RMSprop、梯度裁剪与调度");
+}

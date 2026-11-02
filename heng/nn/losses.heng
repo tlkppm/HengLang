@@ -1,0 +1,40 @@
+import "../ops.heng";
+
+fn nn_mse_loss(tape:AGTape,prediction:i64,target:i64)->i64 {
+    return ag_mean_all(tape,ag_pow(tape,ag_sub(tape,prediction,target),2.0));
+}
+
+fn nn_l1_loss(tape:AGTape,prediction:i64,target:i64)->i64 {
+    return ag_mean_all(tape,ag_abs(tape,ag_sub(tape,prediction,target)));
+}
+
+fn nn_cross_entropy_smooth(tape:AGTape,logits:i64,targets:List<i64>,smoothing:f64)->i64 {
+    let dims=shape(ag_value(tape,logits));
+    assert(len(dims)==2 && dims[0]>0 && dims[1]>0 && len(targets)==dims[0],"交叉熵要求非空二维 logits 和逐行标签");
+    assert(smoothing>=0.0 && smoothing<=1.0,"标签平滑系数必须在零到一之间");
+    let weights=full(dims,smoothing/f64(dims[1]));
+    var index:i64=0;
+    for target in targets {
+        assert(target>=0 && target<dims[1],"交叉熵标签超出类别范围");
+        set(weights,[index,target],1.0-smoothing+smoothing/f64(dims[1]));
+        index=index+1;
+    }
+    let log_probabilities=ag_log_softmax(tape,logits,1);
+    return ag_scale(tape,ag_sum_all(tape,ag_mul(tape,log_probabilities,ag_constant(tape,weights))),-1.0/f64(dims[0]));
+}
+
+fn nn_cross_entropy(tape:AGTape,logits:i64,targets:List<i64>)->i64 {
+    return nn_cross_entropy_smooth(tape,logits,targets,0.0);
+}
+
+fn nn_softplus(tape:AGTape,input:i64)->i64 {
+    let maximum=ag_constant(tape,relu(ag_value(tape,input)));
+    let shifted=ag_sub(tape,input,maximum);
+    let other=ag_exp(tape,ag_scale(tape,maximum,-1.0));
+    return ag_add(tape,maximum,ag_log(tape,ag_add(tape,ag_exp(tape,shifted),other)));
+}
+
+fn nn_binary_cross_entropy_logits(tape:AGTape,logits:i64,targets:i64)->i64 {
+    assert(ag_same_shape(shape(ag_value(tape,logits)),shape(ag_value(tape,targets))),"二元交叉熵形状不匹配");
+    return ag_mean_all(tape,ag_sub(tape,nn_softplus(tape,logits),ag_mul(tape,logits,targets)));
+}

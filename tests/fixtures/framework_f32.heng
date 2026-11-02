@@ -1,0 +1,55 @@
+import "../../heng/heng.heng";
+
+fn f32_fixture_mixed_modules() {
+    let values=tensor([-0.5,0.2,0.8,1.1],[2,2]);
+    for kind in [6,10,12] {
+        let low=ag_tape();
+        let high=ag_tape();
+        var low_module=nn_gelu();
+        var high_module=nn_gelu();
+        if kind==10 {
+            low_module=nn_layer_norm(low,[2],0.00001);
+            high_module=nn_layer_norm(high,[2],0.00001);
+        }
+        if kind==12 {
+            low_module=nn_dropout(0.5);
+            high_module=nn_dropout(0.5);
+        }
+        let low_input=ag_variable(low,cast(values,"f32"),true);
+        let high_input=ag_variable(high,values,true);
+        seed(127);
+        let low_output=nn_forward(low,low_module,low_input);
+        seed(127);
+        let high_output=nn_forward(high,high_module,high_input);
+        assert(dtype(ag_value(low,low_output))=="f64","混合默认 f64 参数或常量应按类型提升规则计算");
+        assert_close(ag_value(low,low_output),ag_value(high,high_output),0.000001,0.000001);
+        let cotangent=tensor([0.2,-0.1,0.4,0.7],[2,2]);
+        ag_backward(low,low_output,cotangent,false);
+        ag_backward(high,high_output,cotangent,false);
+        assert(dtype(ag_grad(low,low_input))=="f32","混合模块求导应保持叶节点梯度类型");
+        assert_close(ag_grad(low,low_input),ag_grad(high,high_input),0.00001,0.00001);
+    }
+}
+
+fn main() {
+    f32_fixture_mixed_modules();
+    let tape=ag_tape();
+    let model=nn_identity();
+    let parameter=nn_parameter(tape,model,cast(tensor([1.0,-2.0],[2]),"f32"));
+    let output=ag_sum_all(tape,ag_pow(tape,parameter,2.0));
+    ag_backward(tape,output,ones([]),false);
+    assert(dtype(ag_grad(tape,parameter))=="f32","f32 参数梯度类型必须保持");
+    assert_close(ag_grad(tape,parameter),tensor([2.0,-4.0],[2]),0.000001,0.000001);
+    let optimizer=opt_adam(tape,[parameter],0.01,0.9,0.999,0.00000001,0.0);
+    opt_step(tape,optimizer);
+    assert(dtype(ag_value(tape,parameter))=="f32","优化更新必须保持 f32 参数类型");
+    assert(dtype(optimizer.first[0])=="f32" && dtype(optimizer.second[0])=="f32","优化器状态类型必须保持");
+    assert_close(ag_value(tape,parameter),tensor([0.99,-1.99],[2]),0.000001,0.000001);
+    let bundle=state_pack(tape,model,optimizer);
+    state_unpack(tape,model,optimizer,bundle);
+    nn_zero_grad(tape,model);
+    assert(dtype(ag_grad(tape,parameter))=="f32","清空梯度必须保持类型");
+    nn_init_constant(tape,parameter,3.0);
+    assert(dtype(ag_value(tape,parameter))=="f32","参数初始化必须保持类型");
+    print("PASS: f32 求导、优化更新、状态恢复与初始化类型保持");
+}

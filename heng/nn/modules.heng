@@ -1,0 +1,441 @@
+import "../ops.heng";
+
+struct NNModule {
+    name:str,
+    kind:i64,
+    parameters:List<i64>,
+    buffers:List<Tensor>,
+    children:List<NNModule>,
+    training:bool,
+    config:List<i64>,
+    scalars:List<f64>
+}
+
+fn nn_module(name:str,kind:i64)->NNModule {
+    let parameters:List<i64>=[];
+    let buffers:List<Tensor>=[];
+    let children:List<NNModule>=[];
+    let config:List<i64>=[];
+    let scalars:List<f64>=[];
+    return NNModule {name:name,kind:kind,parameters:parameters,buffers:buffers,children:children,training:true,config:config,scalars:scalars};
+}
+
+fn nn_register_parameter(module:NNModule,node:i64) {
+    for existing in module.parameters { if existing==node { return; } }
+    push(module.parameters,node);
+}
+
+fn nn_parameter(tape:AGTape,module:NNModule,value:Tensor)->i64 {
+    let node=ag_variable(tape,value,true);
+    nn_register_parameter(module,node);
+    return node;
+}
+
+fn nn_add(module:NNModule,child:NNModule) {
+    push(module.children,child);
+}
+
+fn nn_collect_parameters(module:NNModule,output:List<i64>) {
+    for node in module.parameters {
+        var duplicate=false;
+        for existing in output { if existing==node { duplicate=true; } }
+        if !duplicate { push(output,node); }
+    }
+    for child in module.children { nn_collect_parameters(child,output); }
+}
+
+fn nn_parameters(module:NNModule)->List<i64> {
+    let values:List<i64>=[];
+    nn_collect_parameters(module,values);
+    return values;
+}
+
+fn nn_train(module:NNModule,training:bool) {
+    module.training=training;
+    for child in module.children { nn_train(child,training); }
+}
+
+fn nn_eval(module:NNModule) { nn_train(module,false); }
+
+fn nn_zero_grad(tape:AGTape,module:NNModule) {
+    for parameter in nn_parameters(module) { tape.nodes[parameter].grad=ag_zeros_like(ag_value(tape,parameter)); }
+}
+
+fn nn_clear_graph(tape:AGTape,module:NNModule) {
+    ag_clear_graph(tape,nn_parameters(module));
+}
+
+fn nn_root(value:f64)->f64 { return item(sqrt(full([],value)),0); }
+
+fn nn_init_constant(tape:AGTape,parameter:i64,value:f64) {
+    ag_assign(tape,parameter,ag_match_type(full(shape(ag_value(tape,parameter)),value),ag_value(tape,parameter)));
+}
+
+fn nn_init_normal(tape:AGTape,parameter:i64,average:f64,deviation:f64) {
+    assert(deviation>=0.0,"初始化标准差不能为负");
+    let dims=shape(ag_value(tape,parameter));
+    ag_assign(tape,parameter,ag_match_type(add(scale(randn(dims),deviation),full(dims,average)),ag_value(tape,parameter)));
+}
+
+fn nn_init_uniform(tape:AGTape,parameter:i64,lower:f64,upper:f64) {
+    assert(upper>=lower,"初始化区间无效");
+    let dims=shape(ag_value(tape,parameter));
+    ag_assign(tape,parameter,ag_match_type(add(scale(rand(dims),upper-lower),full(dims,lower)),ag_value(tape,parameter)));
+}
+
+fn nn_init_xavier(tape:AGTape,parameter:i64,fan_in:i64,fan_out:i64) {
+    assert(fan_in>0 && fan_out>0,"初始化输入输出维数必须为正");
+    let bound=nn_root(6.0/f64(fan_in+fan_out));
+    nn_init_uniform(tape,parameter,0.0-bound,bound);
+}
+
+fn nn_init_kaiming(tape:AGTape,parameter:i64,fan_in:i64) {
+    assert(fan_in>0,"初始化输入维数必须为正");
+    nn_init_normal(tape,parameter,0.0,nn_root(2.0/f64(fan_in)));
+}
+
+fn nn_sequential()->NNModule { return nn_module("Sequential",0); }
+
+fn nn_linear(tape:AGTape,input_features:i64,output_features:i64,bias:bool)->NNModule {
+    assert(input_features>0 && output_features>0,"Linear 维数必须为正");
+    let module=nn_module("Linear",1);
+    push(module.config,input_features);
+    push(module.config,output_features);
+    let weight=nn_parameter(tape,module,scale(randn([input_features,output_features]),1.0/nn_root(f64(input_features))));
+    if bias { let bias_node=nn_parameter(tape,module,zeros([output_features])); }
+    return module;
+}
+
+fn nn_embedding(tape:AGTape,count:i64,features:i64)->NNModule {
+    assert(count>0 && features>0,"Embedding 维数必须为正");
+    let module=nn_module("Embedding",2);
+    push(module.config,count);
+    push(module.config,features);
+    let weight=nn_parameter(tape,module,scale(randn([count,features]),1.0/nn_root(f64(features))));
+    return module;
+}
+
+fn nn_embedding_forward(tape:AGTape,module:NNModule,indices:List<i64>)->i64 {
+    assert(module.kind==2,"模块类型不是 Embedding");
+    return ag_gather(tape,module.parameters[0],indices,0);
+}
+
+fn nn_relu()->NNModule { return nn_module("ReLU",3); }
+fn nn_tanh()->NNModule { return nn_module("Tanh",4); }
+fn nn_sigmoid()->NNModule { return nn_module("Sigmoid",5); }
+fn nn_gelu()->NNModule { return nn_module("GELU",6); }
+
+fn nn_softmax(axis:i64)->NNModule {
+    let module=nn_module("Softmax",15);
+    module.config=[axis];
+    return module;
+}
+
+fn nn_log_softmax(axis:i64)->NNModule {
+    let module=nn_module("LogSoftmax",16);
+    module.config=[axis];
+    return module;
+}
+
+fn nn_flatten(start_axis:i64,end_axis:i64)->NNModule {
+    let module=nn_module("Flatten",17);
+    module.config=[start_axis,end_axis];
+    return module;
+}
+
+fn nn_identity()->NNModule { return nn_module("Identity",18); }
+
+fn nn_flatten_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    let first=ag_axis(module.config[0],len(dims));
+    let last=ag_axis(module.config[1],len(dims));
+    assert(last>=first,"Flatten 结束轴不能小于起始轴");
+    let result:List<i64>=[];
+    var flattened:i64=1;
+    var axis:i64=0;
+    while axis<len(dims) {
+        if axis<first || axis>last { push(result,dims[axis]); }
+        else {
+            flattened=flattened*dims[axis];
+            if axis==last { push(result,flattened); }
+        }
+        axis=axis+1;
+    }
+    return ag_reshape(tape,input,result);
+}
+
+fn nn_gelu_forward(tape:AGTape,input:i64)->i64 {
+    let cubic=ag_scale(tape,ag_pow(tape,input,3.0),0.044715);
+    let inner=ag_tanh(tape,ag_scale(tape,ag_add(tape,input,cubic),0.7978845608028654));
+    let one=ag_constant(tape,ones([]));
+    return ag_scale(tape,ag_mul(tape,input,ag_add(tape,one,inner)),0.5);
+}
+
+fn nn_conv2d(tape:AGTape,input_channels:i64,output_channels:i64,kh:i64,kw:i64,stride:i64,padding:i64,bias:bool)->NNModule {
+    assert(input_channels>0 && output_channels>0 && kh>0 && kw>0 && stride>0 && padding>=0,"Conv2D 参数错误");
+    let module=nn_module("Conv2D",7);
+    module.config=[input_channels,output_channels,kh,kw,stride,padding];
+    let weight=nn_parameter(tape,module,scale(randn([output_channels,input_channels,kh,kw]),nn_root(2.0/f64(input_channels*kh*kw))));
+    if bias { let bias_node=nn_parameter(tape,module,zeros([output_channels])); }
+    return module;
+}
+
+fn nn_conv2d_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    assert(len(dims)==4 && dims[1]==module.config[0],"Conv2D 输入必须为匹配通道数的 NCHW");
+    let kh=module.config[2];
+    let kw=module.config[3];
+    let stride=module.config[4];
+    let padding=module.config[5];
+    let height=(dims[2]+2*padding-kh)/stride+1;
+    let width=(dims[3]+2*padding-kw)/stride+1;
+    assert(height>0 && width>0,"Conv2D 输出空间为空");
+    let columns=ag_transpose(tape,ag_unfold2d(tape,input,kh,kw,stride,padding),[0,2,1]);
+    let weights=ag_transpose(tape,ag_reshape(tape,module.parameters[0],[module.config[1],dims[1]*kh*kw]),[1,0]);
+    var output=ag_matmul(tape,columns,weights);
+    if len(module.parameters)==2 { output=ag_add(tape,output,module.parameters[1]); }
+    return ag_reshape(tape,ag_transpose(tape,output,[0,2,1]),[dims[0],module.config[1],height,width]);
+}
+
+fn nn_avg_pool2d(kh:i64,kw:i64,stride:i64,padding:i64)->NNModule {
+    assert(kh>0 && kw>0 && stride>0 && padding>=0,"平均池化参数错误");
+    let module=nn_module("AvgPool2D",8);
+    module.config=[kh,kw,stride,padding];
+    return module;
+}
+
+fn nn_max_pool2d(kh:i64,kw:i64,stride:i64,padding:i64)->NNModule {
+    assert(kh>0 && kw>0 && stride>0 && padding>=0 && padding<kh && padding<kw,"最大池化参数错误");
+    let module=nn_module("MaxPool2D",9);
+    module.config=[kh,kw,stride,padding];
+    return module;
+}
+
+fn nn_pool2d_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    assert(len(dims)==4,"池化输入必须为 NCHW");
+    let kh=module.config[0];
+    let kw=module.config[1];
+    let stride=module.config[2];
+    let padding=module.config[3];
+    let height=(dims[2]+2*padding-kh)/stride+1;
+    let width=(dims[3]+2*padding-kw)/stride+1;
+    assert(height>0 && width>0,"池化输出空间为空");
+    var columns=ag_unfold2d(tape,input,kh,kw,stride,padding);
+    if module.kind==9 && padding>0 {
+        let valid=unfold2d(ones(dims),kh,kw,stride,padding);
+        columns=ag_add(tape,columns,ag_constant(tape,log(valid)));
+    }
+    columns=ag_reshape(tape,columns,[dims[0],dims[1],kh*kw,height*width]);
+    var output=columns;
+    if module.kind==8 { output=ag_mean(tape,columns,2,false); }
+    else { output=ag_max(tape,columns,2,false); }
+    return ag_reshape(tape,output,[dims[0],dims[1],height,width]);
+}
+
+fn nn_layer_norm(tape:AGTape,normalized_shape:List<i64>,epsilon:f64)->NNModule {
+    assert(len(normalized_shape)>0 && epsilon>0.0,"LayerNorm 参数错误");
+    for dimension in normalized_shape { assert(dimension>0,"LayerNorm 维数必须为正"); }
+    let module=nn_module("LayerNorm",10);
+    module.config=ag_copy_indices(normalized_shape);
+    module.scalars=[epsilon];
+    let weight=nn_parameter(tape,module,ones(normalized_shape));
+    let bias=nn_parameter(tape,module,zeros(normalized_shape));
+    return module;
+}
+
+fn nn_layer_norm_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    let first=len(dims)-len(module.config);
+    assert(first>=0,"LayerNorm 输入维数不足");
+    var axis=first;
+    while axis<len(dims) {
+        assert(dims[axis]==module.config[axis-first],"LayerNorm 归一化形状不匹配");
+        axis=axis+1;
+    }
+    var average=input;
+    axis=first;
+    while axis<len(dims) { average=ag_mean(tape,average,axis,true); axis=axis+1; }
+    let centered=ag_sub(tape,input,average);
+    var variance=ag_pow(tape,centered,2.0);
+    axis=first;
+    while axis<len(dims) { variance=ag_mean(tape,variance,axis,true); axis=axis+1; }
+    let epsilon=ag_constant(tape,full([],module.scalars[0]));
+    let normalized=ag_div(tape,centered,ag_sqrt(tape,ag_add(tape,variance,epsilon)));
+    return ag_add(tape,ag_mul(tape,normalized,module.parameters[0]),module.parameters[1]);
+}
+
+fn nn_batch_norm(tape:AGTape,features:i64,epsilon:f64,momentum:f64)->NNModule {
+    assert(features>0 && epsilon>0.0 && momentum>=0.0 && momentum<=1.0,"BatchNorm 参数错误");
+    let module=nn_module("BatchNorm",11);
+    module.config=[features,0];
+    module.scalars=[epsilon,momentum];
+    let weight=nn_parameter(tape,module,ones([features]));
+    let bias=nn_parameter(tape,module,zeros([features]));
+    push(module.buffers,zeros([features]));
+    push(module.buffers,ones([features]));
+    return module;
+}
+
+fn nn_batch_norm_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    assert(len(dims)>=2 && dims[1]==module.config[0],"BatchNorm 通道维数不匹配");
+    let expanded:List<i64>=[];
+    var axis:i64=0;
+    var count:i64=1;
+    while axis<len(dims) {
+        if axis==1 { push(expanded,dims[1]); }
+        else { push(expanded,1); count=count*dims[axis]; }
+        axis=axis+1;
+    }
+    var average=ag_constant(tape,reshape(module.buffers[0],expanded));
+    var variance=ag_constant(tape,reshape(module.buffers[1],expanded));
+    if module.training {
+        assert(count>1,"BatchNorm 训练模式每个通道需要至少两个元素");
+        average=input;
+        axis=0;
+        while axis<len(dims) { if axis!=1 { average=ag_mean(tape,average,axis,true); } axis=axis+1; }
+        variance=ag_pow(tape,ag_sub(tape,input,average),2.0);
+        axis=0;
+        while axis<len(dims) { if axis!=1 { variance=ag_mean(tape,variance,axis,true); } axis=axis+1; }
+        let momentum=module.scalars[1];
+        module.buffers[0]=add(scale(module.buffers[0],1.0-momentum),scale(reshape(ag_value(tape,average),[dims[1]]),momentum));
+        module.buffers[1]=add(scale(module.buffers[1],1.0-momentum),scale(reshape(ag_value(tape,variance),[dims[1]]),momentum*f64(count)/f64(count-1)));
+        module.config[1]=module.config[1]+1;
+    }
+    let epsilon=ag_constant(tape,full([],module.scalars[0]));
+    let normalized=ag_div(tape,ag_sub(tape,input,average),ag_sqrt(tape,ag_add(tape,variance,epsilon)));
+    let weight=ag_reshape(tape,module.parameters[0],expanded);
+    let bias=ag_reshape(tape,module.parameters[1],expanded);
+    return ag_add(tape,ag_mul(tape,normalized,weight),bias);
+}
+
+fn nn_dropout(probability:f64)->NNModule {
+    assert(probability>=0.0 && probability<1.0,"Dropout 概率必须在零到一之间且不含一");
+    let module=nn_module("Dropout",12);
+    module.scalars=[probability];
+    return module;
+}
+
+fn nn_dropout_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    if !module.training || module.scalars[0]==0.0 { return input; }
+    let probability=module.scalars[0];
+    let mask=scale(greater(rand(shape(ag_value(tape,input))),probability),1.0/(1.0-probability));
+    return ag_mul(tape,input,ag_constant(tape,mask));
+}
+
+fn nn_rnn(tape:AGTape,input_features:i64,hidden_features:i64)->NNModule {
+    assert(input_features>0 && hidden_features>0,"RNN 维数必须为正");
+    let module=nn_module("RNN",13);
+    module.config=[input_features,hidden_features];
+    let input_weight=nn_parameter(tape,module,scale(randn([input_features,hidden_features]),1.0/nn_root(f64(input_features))));
+    let hidden_weight=nn_parameter(tape,module,scale(randn([hidden_features,hidden_features]),1.0/nn_root(f64(hidden_features))));
+    let bias=nn_parameter(tape,module,zeros([hidden_features]));
+    return module;
+}
+
+fn nn_rnn_cell(tape:AGTape,module:NNModule,input:i64,hidden:i64)->i64 {
+    let input_part=ag_matmul(tape,input,module.parameters[0]);
+    let hidden_part=ag_matmul(tape,hidden,module.parameters[1]);
+    return ag_tanh(tape,ag_add(tape,ag_add(tape,input_part,hidden_part),module.parameters[2]));
+}
+
+fn nn_rnn_forward(tape:AGTape,module:NNModule,input:i64,initial:i64)->i64 {
+    let dims=shape(ag_value(tape,input));
+    assert(len(dims)==3 && dims[1]>0 && dims[2]==module.config[0],"RNN 输入应为批量、时间、特征");
+    assert(ag_same_shape(shape(ag_value(tape,initial)),[dims[0],module.config[1]]),"RNN 初始隐状态形状不匹配");
+    var hidden=initial;
+    var output=ag_constant(tape,zeros([dims[0],0,module.config[1]]));
+    var time:i64=0;
+    while time<dims[1] {
+        let step=ag_reshape(tape,ag_slice(tape,input,1,time,time+1,1),[dims[0],dims[2]]);
+        hidden=nn_rnn_cell(tape,module,step,hidden);
+        let current=ag_reshape(tape,hidden,[dims[0],1,module.config[1]]);
+        if time==0 { output=current; } else { output=ag_concat(tape,output,current,1); }
+        time=time+1;
+    }
+    return output;
+}
+
+fn nn_multihead_attention(tape:AGTape,features:i64,heads:i64,dropout:f64)->NNModule {
+    assert(features>0 && heads>0 && features%heads==0 && dropout>=0.0 && dropout<1.0,"多头注意力参数错误");
+    let module=nn_module("MultiheadAttention",14);
+    module.config=[features,heads];
+    nn_add(module,nn_linear(tape,features,features,true));
+    nn_add(module,nn_linear(tape,features,features,true));
+    nn_add(module,nn_linear(tape,features,features,true));
+    nn_add(module,nn_linear(tape,features,features,true));
+    nn_add(module,nn_dropout(dropout));
+    return module;
+}
+
+fn nn_attention_forward(tape:AGTape,module:NNModule,query:i64,key:i64,value:i64,mask:Tensor)->i64 {
+    let query_shape=shape(ag_value(tape,query));
+    let key_shape=shape(ag_value(tape,key));
+    let value_shape=shape(ag_value(tape,value));
+    assert(len(query_shape)==3 && len(key_shape)==3 && len(value_shape)==3,"注意力输入必须为三维张量");
+    assert(query_shape[0]==key_shape[0] && key_shape[0]==value_shape[0] && key_shape[1]==value_shape[1],"注意力批量或序列长度不匹配");
+    let features=module.config[0];
+    let heads=module.config[1];
+    let width=features/heads;
+    assert(query_shape[2]==features && key_shape[2]==features && value_shape[2]==features,"注意力特征维数不匹配");
+    let q=ag_transpose(tape,ag_reshape(tape,nn_forward(tape,module.children[0],query),[query_shape[0],query_shape[1],heads,width]),[0,2,1,3]);
+    let k=ag_transpose(tape,ag_reshape(tape,nn_forward(tape,module.children[1],key),[key_shape[0],key_shape[1],heads,width]),[0,2,3,1]);
+    let v=ag_transpose(tape,ag_reshape(tape,nn_forward(tape,module.children[2],value),[value_shape[0],value_shape[1],heads,width]),[0,2,1,3]);
+    let scores=ag_add(tape,ag_scale(tape,ag_matmul(tape,q,k),1.0/nn_root(f64(width))),ag_constant(tape,mask));
+    let probabilities=nn_dropout_forward(tape,module.children[4],ag_softmax(tape,scores,3));
+    let attended=ag_matmul(tape,probabilities,v);
+    let merged=ag_reshape(tape,ag_transpose(tape,attended,[0,2,1,3]),[query_shape[0],query_shape[1],features]);
+    return nn_forward(tape,module.children[3],merged);
+}
+
+fn nn_forward(tape:AGTape,module:NNModule,input:i64)->i64 {
+    if module.kind==0 {
+        var output=input;
+        for child in module.children { output=nn_forward(tape,child,output); }
+        return output;
+    }
+    if module.kind==1 {
+        var output=ag_matmul(tape,input,module.parameters[0]);
+        if len(module.parameters)==2 { output=ag_add(tape,output,module.parameters[1]); }
+        return output;
+    }
+    if module.kind==2 {
+        let indices:List<i64>=[];
+        let source=ag_value(tape,input);
+        var index:i64=0;
+        while index<numel(source) {
+            let value=item(source,index);
+            let integer=i64(value);
+            assert(f64(integer)==value,"Embedding 索引必须为整数");
+            push(indices,integer);
+            index=index+1;
+        }
+        let output=nn_embedding_forward(tape,module,indices);
+        let dims=shape(source);
+        push(dims,module.config[1]);
+        return ag_reshape(tape,output,dims);
+    }
+    if module.kind==3 { return ag_relu(tape,input); }
+    if module.kind==4 { return ag_tanh(tape,input); }
+    if module.kind==5 { return ag_sigmoid(tape,input); }
+    if module.kind==6 { return nn_gelu_forward(tape,input); }
+    if module.kind==7 { return nn_conv2d_forward(tape,module,input); }
+    if module.kind==8 || module.kind==9 { return nn_pool2d_forward(tape,module,input); }
+    if module.kind==10 { return nn_layer_norm_forward(tape,module,input); }
+    if module.kind==11 { return nn_batch_norm_forward(tape,module,input); }
+    if module.kind==12 { return nn_dropout_forward(tape,module,input); }
+    if module.kind==13 {
+        let dims=shape(ag_value(tape,input));
+        assert(len(dims)==3,"RNN 输入必须为三维张量");
+        let initial=ag_constant(tape,zeros([dims[0],module.config[1]]));
+        return nn_rnn_forward(tape,module,input,initial);
+    }
+    if module.kind==14 { return nn_attention_forward(tape,module,input,input,input,zeros([])); }
+    if module.kind==15 { return ag_softmax(tape,input,module.config[0]); }
+    if module.kind==16 { return ag_log_softmax(tape,input,module.config[0]); }
+    if module.kind==17 { return nn_flatten_forward(tape,module,input); }
+    if module.kind==18 { return input; }
+    assert(false,"未知模块类型");
+    return input;
+}

@@ -1,0 +1,79 @@
+struct DataBatch {
+    inputs:Tensor,
+    targets:Tensor,
+    indices:List<i64>
+}
+
+struct DataLoader {
+    inputs:Tensor,
+    targets:Tensor,
+    batch_size:i64,
+    shuffle:bool,
+    drop_last:bool,
+    order:List<i64>,
+    cursor:i64,
+    epoch:i64,
+    random_state:i64
+}
+
+fn data_random(loader:DataLoader)->i64 {
+    loader.random_state=(loader.random_state*48271)%2147483647;
+    return loader.random_state;
+}
+
+fn data_begin_epoch(loader:DataLoader) {
+    clear(loader.order);
+    var index:i64=0;
+    let count=shape(loader.inputs)[0];
+    while index<count { push(loader.order,index); index=index+1; }
+    if loader.shuffle {
+        index=count-1;
+        while index>0 {
+            let position=data_random(loader)%(index+1);
+            let previous=loader.order[index];
+            loader.order[index]=loader.order[position];
+            loader.order[position]=previous;
+            index=index-1;
+        }
+    }
+    loader.cursor=0;
+    loader.epoch=loader.epoch+1;
+}
+
+fn data_loader(inputs:Tensor,targets:Tensor,batch_size:i64,shuffle:bool,drop_last:bool,random_seed:i64)->DataLoader {
+    assert(rank(inputs)>0 && rank(targets)>0 && shape(inputs)[0]==shape(targets)[0],"数据集输入与标签数量不匹配");
+    assert(batch_size>0,"批大小必须为正");
+    var normalized=random_seed%2147483646;
+    if normalized<0 { normalized=normalized+2147483646; }
+    normalized=normalized+1;
+    let order:List<i64>=[];
+    let loader=DataLoader {inputs:inputs,targets:targets,batch_size:batch_size,shuffle:shuffle,drop_last:drop_last,order:order,cursor:0,epoch:0,random_state:normalized};
+    data_begin_epoch(loader);
+    return loader;
+}
+
+fn data_has_next(loader:DataLoader)->bool {
+    let remaining=len(loader.order)-loader.cursor;
+    if loader.drop_last { return remaining>=loader.batch_size; }
+    return remaining>0;
+}
+
+fn data_batch_count(loader:DataLoader)->i64 {
+    let count=len(loader.order);
+    if loader.drop_last { return count/loader.batch_size; }
+    return (count+loader.batch_size-1)/loader.batch_size;
+}
+
+fn data_next(loader:DataLoader)->DataBatch {
+    assert(data_has_next(loader),"当前数据轮次已结束");
+    let indices:List<i64>=[];
+    var count=loader.batch_size;
+    let remaining=len(loader.order)-loader.cursor;
+    if count>remaining { count=remaining; }
+    var index:i64=0;
+    while index<count { push(indices,loader.order[loader.cursor+index]); index=index+1; }
+    loader.cursor=loader.cursor+count;
+    return DataBatch {inputs:gather(loader.inputs,indices,0),targets:gather(loader.targets,indices,0),indices:indices};
+}
+
+fn data_indices(batch:DataBatch)->List<i64> { return batch.indices; }

@@ -1,0 +1,424 @@
+struct AGNode {
+    data:Tensor,
+    grad:Tensor,
+    parents:List<i64>,
+    op:i64,
+    axes:List<i64>,
+    dims:List<i64>,
+    scalar:f64,
+    version:i64,
+    revision:i64,
+    parent_revisions:List<i64>,
+    requires_grad:bool,
+    released:bool
+}
+
+struct AGTape {
+    nodes:List<AGNode>,
+    enabled:bool,
+    consumed:bool
+}
+
+fn ag_tape()->AGTape {
+    let nodes:List<AGNode>=[];
+    return AGTape {nodes:nodes,enabled:true,consumed:false};
+}
+
+fn ag_same_shape(left:List<i64>,right:List<i64>)->bool {
+    if len(left)!=len(right) { return false; }
+    var index:i64=0;
+    while index<len(left) {
+        if left[index]!=right[index] { return false; }
+        index=index+1;
+    }
+    return true;
+}
+
+fn ag_copy_indices(values:List<i64>)->List<i64> {
+    let copied:List<i64>=[];
+    for value in values { push(copied,value); }
+    return copied;
+}
+
+fn ag_axis(axis:i64,dimensions:i64)->i64 {
+    var result=axis;
+    if result<0 { result=result+dimensions; }
+    assert(result>=0 && result<dimensions,"张量轴超出范围");
+    return result;
+}
+
+fn ag_match_type(value:Tensor,reference:Tensor)->Tensor {
+    if dtype(value)==dtype(reference) { return value; }
+    return cast(value,dtype(reference));
+}
+
+fn ag_zeros_like(value:Tensor)->Tensor {
+    return ag_match_type(zeros(shape(value)),value);
+}
+
+fn ag_variable(tape:AGTape,value:Tensor,requires_grad:bool)->i64 {
+    if requires_grad { assert(dtype(value)=="f32" || dtype(value)=="f64","整数和布尔张量不能请求梯度"); }
+    let parents:List<i64>=[];
+    let axes:List<i64>=[];
+    let dims:List<i64>=[];
+    let revisions:List<i64>=[];
+    let node=AGNode {data:value,grad:ag_zeros_like(value),parents:parents,op:0,axes:axes,dims:dims,scalar:0.0,version:tensor_version(value),revision:0,parent_revisions:revisions,requires_grad:requires_grad,released:false};
+    push(tape.nodes,node);
+    return len(tape.nodes)-1;
+}
+
+fn ag_constant(tape:AGTape,value:Tensor)->i64 {
+    return ag_variable(tape,value,false);
+}
+
+fn ag_value(tape:AGTape,node:i64)->Tensor {
+    assert(node>=0 && node<len(tape.nodes),"计算图节点不存在");
+    return tape.nodes[node].data;
+}
+
+fn ag_grad(tape:AGTape,node:i64)->Tensor {
+    return tape.nodes[node].grad;
+}
+
+fn ag_set_enabled(tape:AGTape,enabled:bool)->bool {
+    let previous=tape.enabled;
+    tape.enabled=enabled;
+    return previous;
+}
+
+fn ag_detach(tape:AGTape,node:i64)->i64 {
+    return ag_constant(tape,ag_value(tape,node));
+}
+
+fn ag_assign(tape:AGTape,node:i64,value:Tensor) {
+    let target=tape.nodes[node];
+    assert(target.op==0 && !target.released,"仅允许替换叶节点");
+    assert(ag_same_shape(shape(target.data),shape(value)),"参数替换形状不一致");
+    assert(dtype(target.data)==dtype(value),"参数替换类型不一致");
+    target.data=value;
+    target.grad=ag_zeros_like(value);
+    target.version=tensor_version(value);
+    target.revision=target.revision+1;
+}
+
+fn ag_zero_grad(tape:AGTape) {
+    for node in tape.nodes { node.grad=ag_zeros_like(node.data); }
+}
+
+fn ag_record(tape:AGTape,value:Tensor,parents:List<i64>,op:i64,axes:List<i64>,dims:List<i64>,scalar:f64)->i64 {
+    var required=false;
+    let revisions:List<i64>=[];
+    for parent in parents {
+        assert(parent>=0 && parent<len(tape.nodes),"父节点不存在");
+        let node=tape.nodes[parent];
+        assert(!node.released,"已释放的计算图不能重新使用");
+        assert(tensor_version(node.data)==node.version,"检测到未登记的原地修改");
+        if node.requires_grad { required=true; }
+        push(revisions,node.revision);
+    }
+    if !tape.enabled || !required { return ag_constant(tape,value); }
+    assert(dtype(value)=="f32" || dtype(value)=="f64","可微操作的输出必须为浮点张量");
+    let node=AGNode {data:value,grad:ag_zeros_like(value),parents:ag_copy_indices(parents),op:op,axes:ag_copy_indices(axes),dims:ag_copy_indices(dims),scalar:scalar,version:tensor_version(value),revision:0,parent_revisions:revisions,requires_grad:true,released:false};
+    push(tape.nodes,node);
+    tape.consumed=false;
+    return len(tape.nodes)-1;
+}
+
+fn ag_reachable(tape:AGTape,output:i64)->List<bool> {
+    assert(output>=0 && output<len(tape.nodes),"输出节点不存在");
+    assert(tape.nodes[output].requires_grad,"输出节点不需要梯度");
+    let visited:List<bool>=[];
+    var index:i64=0;
+    while index<len(tape.nodes) { push(visited,index==output); index=index+1; }
+    index=output;
+    while index>=0 {
+        if visited[index] {
+            let node=tape.nodes[index];
+            assert(!node.released,"计算图已释放，请保留图或重新前向计算");
+            assert(tensor_version(node.data)==node.version,"反向计算前检测到原地修改");
+            var edge:i64=0;
+            for parent in node.parents {
+                assert(parent<index,"计算图包含非拓扑有序边");
+                assert(tape.nodes[parent].revision==node.parent_revisions[edge],"参数在前向后被替换");
+                visited[parent]=true;
+                edge=edge+1;
+            }
+        }
+        index=index-1;
+    }
+    return visited;
+}
+
+fn ag_swap_last(value:Tensor)->Tensor {
+    let permutation:List<i64>=[];
+    var index:i64=0;
+    let dimensions=rank(value);
+    assert(dimensions>=2,"矩阵乘法要求至少二维张量");
+    while index<dimensions-2 { push(permutation,index); index=index+1; }
+    push(permutation,dimensions-1);
+    push(permutation,dimensions-2);
+    return transpose(value,permutation);
+}
+
+fn ag_expand_reduction(value:Tensor,input_shape:List<i64>,axis:i64,keep:bool)->Tensor {
+    if keep { return broadcast_to(value,input_shape); }
+    let expanded:List<i64>=[];
+    let reduced=shape(value);
+    var index:i64=0;
+    var source:i64=0;
+    while index<len(input_shape) {
+        if index==axis { push(expanded,1); }
+        else { push(expanded,reduced[source]); source=source+1; }
+        index=index+1;
+    }
+    return broadcast_to(reshape(value,expanded),input_shape);
+}
+
+fn ag_tail(values:List<i64>)->List<i64> {
+    let result:List<i64>=[];
+    var index:i64=1;
+    while index<len(values) { push(result,values[index]); index=index+1; }
+    return result;
+}
+
+fn ag_max_weights(value:Tensor,axis:i64)->Tensor {
+    let maximum=broadcast_to(max(value,axis,true),shape(value));
+    let mask=equal(value,maximum);
+    return div(mask,broadcast_to(sum(mask,axis,true),shape(value)));
+}
+
+fn ag_pullback(tape:AGTape,node:AGNode,edge:i64,incoming:Tensor)->Tensor {
+    let left=tape.nodes[node.parents[0]].data;
+    if node.op==1 { return reduce_to_shape(incoming,shape(tape.nodes[node.parents[edge]].data)); }
+    if node.op==2 {
+        if edge==0 { return reduce_to_shape(incoming,shape(left)); }
+        return reduce_to_shape(scale(incoming,-1.0),shape(tape.nodes[node.parents[1]].data));
+    }
+    if node.op==3 {
+        let other=tape.nodes[node.parents[1-edge]].data;
+        return reduce_to_shape(mul(incoming,other),shape(tape.nodes[node.parents[edge]].data));
+    }
+    if node.op==4 {
+        let right=tape.nodes[node.parents[1]].data;
+        if edge==0 { return reduce_to_shape(div(incoming,right),shape(left)); }
+        return reduce_to_shape(scale(div(mul(incoming,left),mul(right,right)),-1.0),shape(right));
+    }
+    if node.op==5 { return scale(incoming,node.scalar); }
+    if node.op==6 {
+        if node.scalar==0.0 { return zeros(shape(left)); }
+        return mul(incoming,scale(pow(left,node.scalar-1.0),node.scalar));
+    }
+    if node.op==7 { return mul(incoming,node.data); }
+    if node.op==8 { return div(incoming,left); }
+    if node.op==9 { return div(incoming,scale(node.data,2.0)); }
+    if node.op==10 { return mul(incoming,sub(ones(shape(node.data)),mul(node.data,node.data))); }
+    if node.op==11 { return mul(incoming,mul(node.data,sub(ones(shape(node.data)),node.data))); }
+    if node.op==12 { return mul(incoming,greater(left,0.0)); }
+    if node.op==13 { return mul(incoming,sign(left)); }
+    if node.op==14 { return reshape(incoming,shape(left)); }
+    if node.op==15 {
+        let inverse:List<i64>=[];
+        var axis:i64=0;
+        while axis<len(node.axes) {
+            var position:i64=0;
+            while node.axes[position]!=axis { position=position+1; }
+            push(inverse,position);
+            axis=axis+1;
+        }
+        return transpose(incoming,inverse);
+    }
+    if node.op==16 { return ag_expand_reduction(incoming,shape(left),node.axes[0],node.axes[1]==1); }
+    if node.op==17 { return broadcast_to(incoming,shape(left)); }
+    if node.op==18 { return scale(ag_expand_reduction(incoming,shape(left),node.axes[0],node.axes[1]==1),1.0/f64(shape(left)[node.axes[0]])); }
+    if node.op==19 {
+        let right=tape.nodes[node.parents[1]].data;
+        if edge==0 { return reduce_to_shape(matmul(incoming,ag_swap_last(right)),shape(left)); }
+        return reduce_to_shape(matmul(ag_swap_last(left),incoming),shape(right));
+    }
+    if node.op==20 {
+        let weighted=mul(incoming,node.data);
+        return mul(node.data,sub(incoming,broadcast_to(sum(weighted,node.axes[0],true),shape(node.data))));
+    }
+    if node.op==21 { return reduce_to_shape(incoming,shape(left)); }
+    if node.op==22 { return broadcast_to(incoming,shape(left)); }
+    if node.op==23 {
+        let indices:List<i64>=[];
+        var index=node.axes[1];
+        while index<node.axes[2] { push(indices,index); index=index+node.axes[3]; }
+        return scatter_add(zeros(shape(left)),indices,incoming,node.axes[0]);
+    }
+    if node.op==24 {
+        let length=shape(left)[node.axes[0]];
+        if edge==0 { return slice(incoming,node.axes[0],0,length,1); }
+        return slice(incoming,node.axes[0],length,shape(incoming)[node.axes[0]],1);
+    }
+    if node.op==25 { return scatter_add(zeros(shape(left)),ag_tail(node.axes),incoming,node.axes[0]); }
+    if node.op==26 { return fold2d(incoming,shape(left),node.axes[0],node.axes[1],node.axes[2],node.axes[3]); }
+    if node.op==27 { return unfold2d(incoming,node.axes[0],node.axes[1],node.axes[2],node.axes[3]); }
+    if node.op==28 { return mul(ag_expand_reduction(incoming,shape(left),node.axes[0],node.axes[1]==1),ag_max_weights(left,node.axes[0])); }
+    assert(false,"未实现的反向传播操作");
+    return zeros(shape(left));
+}
+
+fn ag_compute_gradients(tape:AGTape,output:i64,seed_value:Tensor)->List<Tensor> {
+    let visited=ag_reachable(tape,output);
+    assert(ag_same_shape(shape(seed_value),shape(tape.nodes[output].data)),"反向种子形状不一致");
+    assert(dtype(seed_value)=="f32" || dtype(seed_value)=="f64","反向种子必须为浮点张量");
+    let gradients:List<Tensor>=[];
+    for node in tape.nodes { push(gradients,ag_zeros_like(node.data)); }
+    gradients[output]=ag_match_type(seed_value,tape.nodes[output].data);
+    var index=output;
+    while index>=0 {
+        if visited[index] {
+            let node=tape.nodes[index];
+            if node.requires_grad && node.op!=0 {
+                var edge:i64=0;
+                for parent in node.parents {
+                    if tape.nodes[parent].requires_grad { gradients[parent]=ag_match_type(add(gradients[parent],ag_pullback(tape,node,edge,gradients[index])),tape.nodes[parent].data); }
+                    edge=edge+1;
+                }
+            }
+        }
+        index=index-1;
+    }
+    return gradients;
+}
+
+fn ag_release(tape:AGTape,output:i64) {
+    let visited=ag_reachable(tape,output);
+    var index:i64=0;
+    while index<len(tape.nodes) {
+        let node=tape.nodes[index];
+        if visited[index] && node.op!=0 {
+            clear(node.parents);
+            clear(node.parent_revisions);
+            clear(node.axes);
+            clear(node.dims);
+            node.released=true;
+        }
+        index=index+1;
+    }
+    tape.consumed=true;
+}
+
+fn ag_backward(tape:AGTape,output:i64,seed_value:Tensor,retain:bool) {
+    let visited=ag_reachable(tape,output);
+    let gradients=ag_compute_gradients(tape,output,seed_value);
+    var index:i64=0;
+    while index<len(tape.nodes) {
+        let node=tape.nodes[index];
+        if visited[index] && node.requires_grad {
+            if node.op==0 { node.grad=ag_match_type(add(node.grad,gradients[index]),node.data); }
+            else { node.grad=gradients[index]; }
+        }
+        index=index+1;
+    }
+    if !retain { ag_release(tape,output); }
+}
+
+fn ag_vjp(tape:AGTape,output:i64,seed_value:Tensor,inputs:List<i64>,retain:bool)->List<Tensor> {
+    let gradients=ag_compute_gradients(tape,output,seed_value);
+    let values:List<Tensor>=[];
+    for input in inputs {
+        assert(input>=0 && input<len(tape.nodes),"VJP 输入节点不存在");
+        assert(tape.nodes[input].requires_grad,"VJP 输入必须为可微节点");
+        push(values,gradients[input]);
+    }
+    if !retain { ag_release(tape,output); }
+    return values;
+}
+
+fn ag_pushforward(tape:AGTape,node:AGNode,tangents:List<Tensor>)->Tensor {
+    let left=tape.nodes[node.parents[0]].data;
+    let tangent=tangents[node.parents[0]];
+    if node.op==1 { return add(tangent,tangents[node.parents[1]]); }
+    if node.op==2 { return sub(tangent,tangents[node.parents[1]]); }
+    if node.op==3 { return add(mul(tangent,tape.nodes[node.parents[1]].data),mul(left,tangents[node.parents[1]])); }
+    if node.op==4 {
+        let right=tape.nodes[node.parents[1]].data;
+        return div(sub(mul(tangent,right),mul(left,tangents[node.parents[1]])),mul(right,right));
+    }
+    if node.op>=5 && node.op<=13 { return ag_pullback(tape,node,0,tangent); }
+    if node.op==14 { return reshape(tangent,shape(node.data)); }
+    if node.op==15 { return transpose(tangent,node.axes); }
+    if node.op==16 { return sum(tangent,node.axes[0],node.axes[1]==1); }
+    if node.op==17 { return sum_all(tangent); }
+    if node.op==18 { return mean(tangent,node.axes[0],node.axes[1]==1); }
+    if node.op==19 { return add(matmul(tangent,tape.nodes[node.parents[1]].data),matmul(left,tangents[node.parents[1]])); }
+    if node.op==20 { return ag_pullback(tape,node,0,tangent); }
+    if node.op==21 { return broadcast_to(tangent,node.dims); }
+    if node.op==22 { return reduce_to_shape(tangent,node.dims); }
+    if node.op==23 { return slice(tangent,node.axes[0],node.axes[1],node.axes[2],node.axes[3]); }
+    if node.op==24 { return concat(tangent,tangents[node.parents[1]],node.axes[0]); }
+    if node.op==25 { return gather(tangent,ag_tail(node.axes),node.axes[0]); }
+    if node.op==26 { return unfold2d(tangent,node.axes[0],node.axes[1],node.axes[2],node.axes[3]); }
+    if node.op==27 { return fold2d(tangent,node.dims,node.axes[0],node.axes[1],node.axes[2],node.axes[3]); }
+    if node.op==28 { return sum(mul(tangent,ag_max_weights(left,node.axes[0])),node.axes[0],node.axes[1]==1); }
+    assert(false,"未实现的正向切向传播操作");
+    return zeros(shape(node.data));
+}
+
+fn ag_jvp(tape:AGTape,output:i64,inputs:List<i64>,seeds:List<Tensor>)->Tensor {
+    let visited=ag_reachable(tape,output);
+    assert(len(inputs)==len(seeds),"JVP 输入与种子数量不一致");
+    let tangents:List<Tensor>=[];
+    for node in tape.nodes { push(tangents,ag_zeros_like(node.data)); }
+    var position:i64=0;
+    for input in inputs {
+        assert(input>=0 && input<len(tape.nodes),"JVP 输入节点不存在");
+        assert(tape.nodes[input].op==0 && tape.nodes[input].requires_grad,"JVP 种子必须对应可微叶节点");
+        assert(ag_same_shape(shape(seeds[position]),shape(tape.nodes[input].data)),"JVP 种子形状不一致");
+        assert(dtype(seeds[position])=="f32" || dtype(seeds[position])=="f64","JVP 种子必须为浮点张量");
+        tangents[input]=ag_match_type(add(tangents[input],seeds[position]),tape.nodes[input].data);
+        position=position+1;
+    }
+    var index:i64=0;
+    while index<=output {
+        if visited[index] && tape.nodes[index].op!=0 { tangents[index]=ag_match_type(ag_pushforward(tape,tape.nodes[index],tangents),tape.nodes[index].data); }
+        index=index+1;
+    }
+    return tangents[output];
+}
+
+fn ag_clear_graph(tape:AGTape,keep:List<i64>) {
+    var last:i64=-1;
+    for index in keep {
+        assert(index>=0 && index<len(tape.nodes),"保留的叶节点不存在");
+        assert(tape.nodes[index].op==0 && !tape.nodes[index].released,"只能保留未释放的叶节点");
+        if index>last { last=index; }
+    }
+    while len(tape.nodes)>last+1 { let removed=pop(tape.nodes); }
+    var index:i64=0;
+    while index<len(tape.nodes) {
+        var preserved=false;
+        for value in keep { if value==index { preserved=true; } }
+        if !preserved {
+            let node=tape.nodes[index];
+            clear(node.parents);
+            clear(node.parent_revisions);
+            clear(node.axes);
+            clear(node.dims);
+            node.data=zeros([0]);
+            node.grad=zeros([0]);
+            node.requires_grad=false;
+            node.released=true;
+        }
+        index=index+1;
+    }
+    tape.consumed=true;
+}
+
+fn ag_reset_graph(tape:AGTape) {
+    for node in tape.nodes {
+        if node.op!=0 {
+            clear(node.parents);
+            clear(node.parent_revisions);
+            clear(node.axes);
+            clear(node.dims);
+            node.data=zeros([0]);
+            node.grad=zeros([0]);
+            node.released=true;
+        }
+    }
+    tape.consumed=true;
+}

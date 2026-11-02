@@ -1,0 +1,7 @@
+import "ops.heng";
+
+fn main() -> void {
+    let tape = ag_tape();
+    let integer_parameter = ag_variable(tape, cast(ones([2]), "i64"), true);
+    print(ag_value(tape, integer_parameter));
+}

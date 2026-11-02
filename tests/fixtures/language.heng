@@ -1,0 +1,81 @@
+enum Mode { Ready, Done }
+
+struct Pair {
+    first: i64,
+    second: f64
+}
+
+struct Link {
+    children: List<Link>,
+    value: i64
+}
+
+fn identity<T>(value: T) -> T {
+    return value;
+}
+
+fn factorial(value: i64) -> i64 {
+    if value <= 1 {
+        return 1;
+    }
+    return value * factorial(value - 1);
+}
+
+fn successful() -> Result<i64> {
+    return result_ok(42);
+}
+
+fn unsuccessful() -> Result<i64> {
+    return result_err("预期的测试错误");
+}
+
+fn create_cycle() -> void {
+    let node = Link { children: [], value: 1 };
+    push(node.children, node);
+}
+
+fn main() -> i64 {
+    assert(factorial(6) == 720, "递归结果错误");
+    assert(identity<i64>(9) == 9, "泛型实例化错误");
+    let pair = Pair { first: 3, second: 2.5 };
+    pair.first = 7;
+    assert(pair.first == 7, "结构体字段修改错误");
+    let mode = Mode.Done;
+    assert(mode == Mode.Done, "枚举值错误");
+    let values: List<i64> = [1, 2, 3];
+    push(values, 4);
+    values[0] = 2;
+    var total: i64 = 0;
+    for value in values {
+        total += value;
+    }
+    assert(total == 11, "列表或迭代错误");
+    var index: i64 = 0;
+    while index < 10 {
+        index += 1;
+        if index == 3 {
+            continue;
+        }
+        if index == 5 {
+            break;
+        }
+    }
+    assert(index == 5, "循环控制流错误");
+    assert(result_value(successful()) == 42, "成功结果解包错误");
+    assert(!result_is_ok(unsuccessful()), "失败结果状态错误");
+    assert(result_error(unsuccessful()) == "预期的测试错误", "失败结果内容错误");
+    assert(!(false && (1 / 0 == 0)), "逻辑短路错误");
+    assert(true || (1 / 0 == 0), "逻辑短路错误");
+    let promoted: f64 = 3;
+    assert(promoted / 2.0 == 1.5, "数值提升错误");
+    let text = "衡言" + "语言";
+    print(text);
+    gc_collect();
+    let before = live_objects();
+    create_cycle();
+    gc_collect();
+    let after = live_objects();
+    assert(after == before, "引用环未释放");
+    print("PASS: HengLang 原生语言验证通过");
+    return 0;
+}

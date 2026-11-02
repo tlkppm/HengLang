@@ -1,0 +1,78 @@
+import "../../heng/heng.heng";
+
+fn state_fixture_shared_parameter() {
+    let tape=ag_tape();
+    let model=nn_sequential();
+    let shared=nn_linear(tape,1,1,false);
+    nn_init_constant(tape,shared.parameters[0],2.0);
+    nn_add(model,shared);
+    nn_add(model,shared);
+    let parameter=shared.parameters[0];
+    let optimizer=opt_sgd(tape,nn_parameters(model),0.1,0.0,0.0,false);
+    let input=ag_variable(tape,full([1,1],3.0),true);
+    let output=nn_forward(tape,model,input);
+    assert_close(ag_value(tape,output),full([1,1],12.0),0.000000000001,0.000000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,parameter),full([1,1],12.0),0.000000000001,0.000000000001);
+    assert_close(ag_grad(tape,input),full([1,1],4.0),0.000000000001,0.000000000001);
+    opt_step(tape,optimizer);
+    let saved=state_pack(tape,model,optimizer);
+    nn_init_constant(tape,parameter,5.0);
+    optimizer.steps=99;
+    state_unpack(tape,model,optimizer,saved);
+    assert(len(nn_parameters(model))==1 && len(optimizer.parameters)==1,"共享参数恢复后仍必须去重");
+    assert(model.children[0].parameters[0]==model.children[1].parameters[0],"恢复必须保持共享参数节点");
+    assert(optimizer.steps==1,"共享参数优化器步数恢复错误");
+    assert_close(ag_value(tape,parameter),full([1,1],0.8),0.000000000001,0.000000000001);
+    nn_clear_graph(tape,model);
+    nn_zero_grad(tape,model);
+    let fresh=nn_forward(tape,model,ag_constant(tape,full([1,1],3.0)));
+    assert_close(ag_value(tape,fresh),full([1,1],1.92),0.000000000001,0.000000000001);
+    ag_backward(tape,ag_sum_all(tape,fresh),ones([]),false);
+    assert_close(ag_grad(tape,parameter),full([1,1],4.8),0.000000000001,0.000000000001);
+}
+
+fn main() {
+    state_fixture_shared_parameter();
+    seed(19);
+    let tape=ag_tape();
+    let model=nn_sequential();
+    let linear=nn_linear(tape,2,2,true);
+    let normalization=nn_batch_norm(tape,2,0.00001,0.1);
+    let dropout=nn_dropout(0.25);
+    nn_add(model,linear);
+    nn_add(model,normalization);
+    nn_add(model,dropout);
+    let optimizer=opt_adam(tape,nn_parameters(model),0.01,0.9,0.999,0.00000001,0.0);
+    for parameter in optimizer.parameters { tape.nodes[parameter].grad=full(shape(ag_value(tape,parameter)),0.25); }
+    opt_step(tape,optimizer);
+    let input=ag_constant(tape,tensor([1.0,2.0,3.0,4.0],[2,2]));
+    let output=nn_forward(tape,model,input);
+    let saved=state_pack(tape,model,optimizer);
+    state_save_checkpoint(".build/framework_state_test.bin",tape,model,optimizer);
+    let expected_random=rand([4]);
+    for parameter in optimizer.parameters { nn_init_constant(tape,parameter,9.0); }
+    normalization.buffers[0]=full([2],99.0);
+    normalization.buffers[1]=full([2],99.0);
+    normalization.config[1]=99;
+    optimizer.steps=99;
+    optimizer.learning_rate=9.0;
+    optimizer.first[0]=zeros(shape(optimizer.first[0]));
+    nn_eval(model);
+    seed(999);
+    state_load_checkpoint(".build/framework_state_test.bin",tape,model,optimizer);
+    let restored=state_pack(tape,model,optimizer);
+    assert(len(saved.tensors)==len(restored.tensors),"状态张量数量恢复错误");
+    var index:i64=0;
+    while index<len(saved.tensors) { assert_close(saved.tensors[index],restored.tensors[index],0.0,0.0); index=index+1; }
+    assert(len(saved.ints)==len(restored.ints),"状态整数数量恢复错误");
+    index=0;
+    while index<len(saved.ints) { assert(saved.ints[index]==restored.ints[index],"参数映射、模式、计数或随机状态恢复错误"); index=index+1; }
+    assert(len(saved.floats)==len(restored.floats),"状态浮点数量恢复错误");
+    index=0;
+    while index<len(saved.floats) { assert(saved.floats[index]==restored.floats[index],"超参数恢复错误"); index=index+1; }
+    assert_close(rand([4]),expected_random,0.0,0.0);
+    assert(model.training && linear.training && dropout.training,"模块模式必须恢复");
+    assert(optimizer.steps==1 && normalization.config[1]==1,"优化器与 BatchNorm 计数必须恢复");
+    print("PASS: 二进制保存加载、模型参数、缓冲、优化器、模式与随机数状态");
+}

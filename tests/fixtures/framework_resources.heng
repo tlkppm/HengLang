@@ -1,0 +1,30 @@
+import "../../heng/heng.heng";
+
+fn resource_cycle(tape:AGTape,parameter:i64) {
+    let output=ag_sum_all(tape,ag_relu(tape,ag_add(tape,ag_pow(tape,parameter,2.0),ag_constant(tape,full([],0.25)))));
+    ag_backward(tape,output,ones([]),false);
+    ag_clear_graph(tape,[parameter]);
+    ag_zero_grad(tape);
+}
+
+fn main() {
+    let tape=ag_tape();
+    let parameter=ag_variable(tape,full([1024],0.5),true);
+    resource_cycle(tape,parameter);
+    gc_collect();
+    let baseline=memory_bytes();
+    var index:i64=0;
+    while index<100 {
+        resource_cycle(tape,parameter);
+        gc_collect();
+        assert(len(tape.nodes)==1,"清图后只能保留叶参数节点");
+        assert(memory_bytes()<=baseline+1024,"重复构图求导与清图不得持续占用活动内存");
+        assert(cached_memory_bytes()<=16777216,"缓存内存必须有界");
+        index+=1;
+    }
+    assert(buffer_reuse_count()>0,"重复求导应实际复用临时存储");
+    assert_close(ag_value(tape,parameter),full([1024],0.5),0.0,0.0);
+    trim_buffers();
+    assert(cached_memory_bytes()==0,"缓存应能显式归还");
+    print("PASS: 重复构图求导清图、活动内存有界与临时存储复用");
+}

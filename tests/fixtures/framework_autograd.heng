@@ -1,0 +1,44 @@
+import "../../heng/ops.heng";
+
+fn main() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,tensor([2.0,3.0],[2]),true);
+    let squared=ag_mul(tape,input,input);
+    let output=ag_sum_all(tape,squared);
+    assert_close(ag_value(tape,output),tensor([13.0],[]),0.000000001,0.000000001);
+    let vjp=ag_vjp(tape,output,ones([]),[input],true);
+    assert_close(vjp[0],tensor([4.0,6.0],[2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,input),zeros([2]),0.000000001,0.000000001);
+    let tangent=ag_jvp(tape,output,[input],[tensor([1.0,2.0],[2])]);
+    assert_close(tangent,tensor([16.0],[]),0.000000001,0.000000001);
+    ag_backward(tape,output,ones([]),true);
+    assert_close(ag_grad(tape,input),tensor([4.0,6.0],[2]),0.000000001,0.000000001);
+    ag_backward(tape,output,ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([8.0,12.0],[2]),0.000000001,0.000000001);
+    ag_zero_grad(tape);
+    let bias=ag_variable(tape,tensor([1.0,2.0],[2]),true);
+    let matrix=ag_variable(tape,tensor([1.0,2.0,3.0,4.0],[2,2]),true);
+    let broadcasted=ag_sum_all(tape,ag_add(tape,matrix,bias));
+    ag_backward(tape,broadcasted,ones([]),false);
+    assert_close(ag_grad(tape,bias),tensor([2.0,2.0],[2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,matrix),ones([2,2]),0.000000001,0.000000001);
+    let detached=ag_detach(tape,input);
+    let shared=ag_sum_all(tape,ag_add(tape,ag_mul(tape,input,input),ag_mul(tape,input,detached)));
+    ag_backward(tape,shared,ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([6.0,9.0],[2]),0.000000001,0.000000001);
+    ag_reset_graph(tape);
+    let reused=ag_sum_all(tape,ag_scale(tape,input,3.0));
+    ag_backward(tape,reused,ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([9.0,12.0],[2]),0.000000001,0.000000001);
+    let previous=ag_set_enabled(tape,false);
+    let inference=ag_scale(tape,input,2.0);
+    assert(!tape.nodes[inference].requires_grad && len(tape.nodes[inference].parents)==0,"关闭梯度记录后不得建立可微边");
+    let disabled=ag_set_enabled(tape,previous);
+    ag_clear_graph(tape,[input]);
+    assert(len(tape.nodes)==input+1,"显式清图应释放参数之后的节点槽位");
+    ag_zero_grad(tape);
+    let after_clear=ag_sum_all(tape,ag_pow(tape,input,2.0));
+    ag_backward(tape,after_clear,ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([4.0,6.0],[2]),0.000000001,0.000000001);
+    print("PASS: 计算图、广播、共享参数、VJP、JVP、detach、清图与叶参数复用");
+}

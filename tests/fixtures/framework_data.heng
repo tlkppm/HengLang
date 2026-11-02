@@ -1,0 +1,39 @@
+import "../../heng/data.heng";
+
+fn main() {
+    let inputs=reshape(arange(10),[5,2]);
+    let targets=arange(5);
+    let ordered=data_loader(inputs,targets,2,false,false,17);
+    assert(data_batch_count(ordered)==3,"批数量应向上取整");
+    let first=data_next(ordered);
+    assert_close(first.inputs,tensor([0.0,1.0,2.0,3.0],[2,2]),0.000000001,0.000000001);
+    assert_close(first.targets,tensor([0.0,1.0],[2]),0.000000001,0.000000001);
+    let second=data_next(ordered);
+    let third=data_next(ordered);
+    assert_close(third.inputs,tensor([8.0,9.0],[1,2]),0.000000001,0.000000001);
+    assert(!data_has_next(ordered),"末批之后应耗尽");
+    let truncated=data_loader(inputs,targets,2,false,true,17);
+    assert(data_batch_count(truncated)==2,"丢弃末批时批数量错误");
+    let truncated_first=data_next(truncated);
+    let truncated_second=data_next(truncated);
+    assert(!data_has_next(truncated),"不足一批的样本应丢弃");
+    let left=data_loader(inputs,targets,2,true,false,17);
+    let right=data_loader(inputs,targets,2,true,false,17);
+    var index:i64=0;
+    while index<5 {
+        assert(left.order[index]==right.order[index],"相同种子 shuffle 必须确定");
+        var matches:i64=0;
+        for value in left.order { if value==index { matches=matches+1; } }
+        assert(matches==1,"shuffle 必须保留每个样本且不重复");
+        index=index+1;
+    }
+    data_begin_epoch(left);
+    data_begin_epoch(right);
+    index=0;
+    while index<5 { assert(left.order[index]==right.order[index],"后续轮次 shuffle 必须确定"); index=index+1; }
+    let empty=data_loader(zeros([0,2]),zeros([0]),2,true,false,0);
+    assert(data_batch_count(empty)==0 && !data_has_next(empty),"空数据集处理错误");
+    let negative_seed=data_loader(inputs,targets,2,true,false,-2147483646);
+    assert(negative_seed.random_state>0 && negative_seed.random_state<2147483647,"负边界种子不得进入零状态");
+    print("PASS: 本地批处理、末批策略、空数据集与确定性 shuffle");
+}

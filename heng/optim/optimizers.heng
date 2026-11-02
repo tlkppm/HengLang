@@ -1,0 +1,214 @@
+import "../autograd.heng";
+
+struct OPTOptimizer {
+    parameters:List<i64>,
+    kind:i64,
+    learning_rate:f64,
+    beta1:f64,
+    beta2:f64,
+    epsilon:f64,
+    weight_decay:f64,
+    momentum:f64,
+    nesterov:bool,
+    centered:bool,
+    steps:i64,
+    first:List<Tensor>,
+    second:List<Tensor>,
+    third:List<Tensor>
+}
+
+struct OPTSchedule {
+    base_rate:f64,
+    kind:i64,
+    interval:i64,
+    duration:i64,
+    gamma:f64,
+    minimum:f64,
+    steps:i64
+}
+
+fn opt_create(tape:AGTape,parameters:List<i64>,kind:i64,learning_rate:f64)->OPTOptimizer {
+    assert(learning_rate>=0.0,"学习率不能为负");
+    let unique:List<i64>=[];
+    let first:List<Tensor>=[];
+    let second:List<Tensor>=[];
+    let third:List<Tensor>=[];
+    for parameter in parameters {
+        assert(parameter>=0 && parameter<len(tape.nodes),"优化器参数节点不存在");
+        let node=tape.nodes[parameter];
+        assert(node.op==0 && node.requires_grad && !node.released,"优化器参数必须为可微叶节点");
+        var duplicate=false;
+        for existing in unique { if existing==parameter { duplicate=true; } }
+        if !duplicate {
+            push(unique,parameter);
+            push(first,ag_zeros_like(node.data));
+            push(second,ag_zeros_like(node.data));
+            push(third,ag_zeros_like(node.data));
+        }
+    }
+    return OPTOptimizer {parameters:unique,kind:kind,learning_rate:learning_rate,beta1:0.9,beta2:0.999,epsilon:0.00000001,weight_decay:0.0,momentum:0.0,nesterov:false,centered:false,steps:0,first:first,second:second,third:third};
+}
+
+fn opt_sgd(tape:AGTape,parameters:List<i64>,learning_rate:f64,momentum:f64,weight_decay:f64,nesterov:bool)->OPTOptimizer {
+    assert(momentum>=0.0 && momentum<1.0 && weight_decay>=0.0,"SGD 参数错误");
+    assert(!nesterov || momentum>0.0,"Nesterov 要求正动量");
+    let optimizer=opt_create(tape,parameters,0,learning_rate);
+    optimizer.momentum=momentum;
+    optimizer.weight_decay=weight_decay;
+    optimizer.nesterov=nesterov;
+    return optimizer;
+}
+
+fn opt_momentum(tape:AGTape,parameters:List<i64>,learning_rate:f64,momentum:f64)->OPTOptimizer {
+    return opt_sgd(tape,parameters,learning_rate,momentum,0.0,false);
+}
+
+fn opt_adam(tape:AGTape,parameters:List<i64>,learning_rate:f64,beta1:f64,beta2:f64,epsilon:f64,weight_decay:f64)->OPTOptimizer {
+    assert(beta1>=0.0 && beta1<1.0 && beta2>=0.0 && beta2<1.0 && epsilon>0.0 && weight_decay>=0.0,"Adam 参数错误");
+    let optimizer=opt_create(tape,parameters,1,learning_rate);
+    optimizer.beta1=beta1;
+    optimizer.beta2=beta2;
+    optimizer.epsilon=epsilon;
+    optimizer.weight_decay=weight_decay;
+    return optimizer;
+}
+
+fn opt_adamw(tape:AGTape,parameters:List<i64>,learning_rate:f64,beta1:f64,beta2:f64,epsilon:f64,weight_decay:f64)->OPTOptimizer {
+    let optimizer=opt_adam(tape,parameters,learning_rate,beta1,beta2,epsilon,weight_decay);
+    optimizer.kind=2;
+    return optimizer;
+}
+
+fn opt_rmsprop(tape:AGTape,parameters:List<i64>,learning_rate:f64,alpha:f64,epsilon:f64,momentum:f64,weight_decay:f64,centered:bool)->OPTOptimizer {
+    assert(alpha>=0.0 && alpha<1.0 && epsilon>0.0 && momentum>=0.0 && momentum<1.0 && weight_decay>=0.0,"RMSprop 参数错误");
+    let optimizer=opt_create(tape,parameters,3,learning_rate);
+    optimizer.beta2=alpha;
+    optimizer.epsilon=epsilon;
+    optimizer.momentum=momentum;
+    optimizer.weight_decay=weight_decay;
+    optimizer.centered=centered;
+    return optimizer;
+}
+
+fn opt_scalar_power(value:f64,power_value:i64)->f64 {
+    var result=1.0;
+    var index:i64=0;
+    while index<power_value { result=result*value; index=index+1; }
+    return result;
+}
+
+fn opt_step(tape:AGTape,optimizer:OPTOptimizer) {
+    for parameter in optimizer.parameters {
+        let node=tape.nodes[parameter];
+        assert(tensor_version(node.data)==node.version,"优化器检测到未登记的原地参数修改");
+        assert(ag_same_shape(shape(node.grad),shape(node.data)),"参数梯度形状错误");
+    }
+    optimizer.steps=optimizer.steps+1;
+    var index:i64=0;
+    for parameter in optimizer.parameters {
+        let value=ag_value(tape,parameter);
+        let original_gradient=ag_grad(tape,parameter);
+        var gradient=original_gradient;
+        if optimizer.weight_decay>0.0 && optimizer.kind!=2 { gradient=add(gradient,scale(value,optimizer.weight_decay)); }
+        var update=gradient;
+        if optimizer.kind==0 {
+            if optimizer.momentum>0.0 {
+                optimizer.first[index]=add(scale(optimizer.first[index],optimizer.momentum),gradient);
+                update=optimizer.first[index];
+                if optimizer.nesterov { update=add(gradient,scale(update,optimizer.momentum)); }
+            }
+        }
+        else {
+            if optimizer.kind==1 || optimizer.kind==2 {
+                optimizer.first[index]=add(scale(optimizer.first[index],optimizer.beta1),scale(gradient,1.0-optimizer.beta1));
+                optimizer.second[index]=add(scale(optimizer.second[index],optimizer.beta2),scale(mul(gradient,gradient),1.0-optimizer.beta2));
+                let first=scale(optimizer.first[index],1.0/(1.0-opt_scalar_power(optimizer.beta1,optimizer.steps)));
+                let second=scale(optimizer.second[index],1.0/(1.0-opt_scalar_power(optimizer.beta2,optimizer.steps)));
+                update=div(first,add(sqrt(second),full([],optimizer.epsilon)));
+            }
+            else {
+                assert(optimizer.kind==3,"未知优化器类型");
+                optimizer.second[index]=add(scale(optimizer.second[index],optimizer.beta2),scale(mul(gradient,gradient),1.0-optimizer.beta2));
+                var variance=optimizer.second[index];
+                if optimizer.centered {
+                    optimizer.third[index]=add(scale(optimizer.third[index],optimizer.beta2),scale(gradient,1.0-optimizer.beta2));
+                    variance=relu(sub(variance,mul(optimizer.third[index],optimizer.third[index])));
+                }
+                update=div(gradient,add(sqrt(variance),full([],optimizer.epsilon)));
+                if optimizer.momentum>0.0 {
+                    optimizer.first[index]=add(scale(optimizer.first[index],optimizer.momentum),update);
+                    update=optimizer.first[index];
+                }
+            }
+        }
+        var next=sub(value,scale(update,optimizer.learning_rate));
+        if optimizer.kind==2 && optimizer.weight_decay>0.0 {
+            next=sub(next,scale(value,optimizer.learning_rate*optimizer.weight_decay));
+        }
+        optimizer.first[index]=ag_match_type(optimizer.first[index],value);
+        optimizer.second[index]=ag_match_type(optimizer.second[index],value);
+        optimizer.third[index]=ag_match_type(optimizer.third[index],value);
+        ag_assign(tape,parameter,ag_match_type(next,value));
+        tape.nodes[parameter].grad=original_gradient;
+        index=index+1;
+    }
+}
+
+fn opt_zero_grad(tape:AGTape,optimizer:OPTOptimizer) {
+    for parameter in optimizer.parameters { tape.nodes[parameter].grad=ag_zeros_like(ag_value(tape,parameter)); }
+}
+
+fn opt_clip_grad_value(tape:AGTape,parameters:List<i64>,limit:f64) {
+    assert(limit>=0.0,"梯度裁剪阈值不能为负");
+    for parameter in parameters {
+        let gradient=tape.nodes[parameter].grad;
+        let upper=sub(gradient,relu(sub(gradient,full([],limit))));
+        tape.nodes[parameter].grad=ag_match_type(add(upper,relu(sub(full([],0.0-limit),upper))),gradient);
+    }
+}
+
+fn opt_clip_grad_norm(tape:AGTape,parameters:List<i64>,maximum:f64,epsilon:f64)->f64 {
+    assert(maximum>=0.0 && epsilon>0.0,"梯度范数裁剪参数错误");
+    var squared=0.0;
+    let unique:List<i64>=[];
+    for parameter in parameters {
+        var duplicate=false;
+        for previous in unique { if previous==parameter { duplicate=true; } }
+        if !duplicate { push(unique,parameter); squared=squared+item(sum_all(pow(tape.nodes[parameter].grad,2.0)),0); }
+    }
+    let norm=item(sqrt(full([],squared)),0);
+    if norm>maximum {
+        let factor=maximum/(norm+epsilon);
+        for parameter in unique { tape.nodes[parameter].grad=ag_match_type(scale(tape.nodes[parameter].grad,factor),ag_value(tape,parameter)); }
+    }
+    return norm;
+}
+
+fn opt_step_schedule(optimizer:OPTOptimizer,interval:i64,gamma:f64)->OPTSchedule {
+    assert(interval>0 && gamma>=0.0,"学习率阶梯调度参数错误");
+    return OPTSchedule {base_rate:optimizer.learning_rate,kind:0,interval:interval,duration:1,gamma:gamma,minimum:0.0,steps:0};
+}
+
+fn opt_linear_schedule(optimizer:OPTOptimizer,duration:i64,minimum:f64)->OPTSchedule {
+    assert(duration>0 && minimum>=0.0 && minimum<=optimizer.learning_rate,"线性学习率调度参数错误");
+    return OPTSchedule {base_rate:optimizer.learning_rate,kind:1,interval:1,duration:duration,gamma:1.0,minimum:minimum,steps:0};
+}
+
+fn opt_exponential_schedule(optimizer:OPTOptimizer,gamma:f64)->OPTSchedule {
+    assert(gamma>=0.0,"指数学习率调度参数错误");
+    return opt_step_schedule(optimizer,1,gamma);
+}
+
+fn opt_schedule_step(optimizer:OPTOptimizer,schedule:OPTSchedule)->f64 {
+    schedule.steps=schedule.steps+1;
+    if schedule.kind==0 {
+        optimizer.learning_rate=schedule.base_rate*opt_scalar_power(schedule.gamma,schedule.steps/schedule.interval);
+    }
+    else {
+        assert(schedule.kind==1,"未知学习率调度类型");
+        var progress=f64(schedule.steps)/f64(schedule.duration);
+        if progress>1.0 { progress=1.0; }
+        optimizer.learning_rate=schedule.base_rate+(schedule.minimum-schedule.base_rate)*progress;
+    }
+    return optimizer.learning_rate;
+}

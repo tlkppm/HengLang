@@ -1,0 +1,134 @@
+fn bench_median(values: List<f64>) -> f64 {
+    var outer: i64 = 0;
+    while outer < len(values) {
+        var inner: i64 = outer + 1;
+        while inner < len(values) {
+            if values[inner] < values[outer] {
+                let value = values[inner];
+                values[inner] = values[outer];
+                values[outer] = value;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    return (values[len(values) / 2 - 1] + values[len(values) / 2]) / 2.0;
+}
+
+fn bench_matrix(size: i64, optimized: bool) -> f64 {
+    set_optimized(optimized);
+    seed(412);
+    let left = rand([size, size]);
+    let right = rand([size, size]);
+    var warm: i64 = 0;
+    while warm < 3 {
+        let result = matmul(left, right);
+        assert(numel(result) == size * size, "矩阵预热结果错误");
+        warm += 1;
+    }
+    let samples: List<f64> = [];
+    var index: i64 = 0;
+    while index < 20 {
+        gc_collect();
+        let start = clock();
+        let result = matmul(left, right);
+        let elapsed = clock() - start;
+        assert(numel(result) == size * size, "矩阵测量结果错误");
+        push(samples, elapsed);
+        index += 1;
+    }
+    return bench_median(samples);
+}
+
+fn bench_elementwise(input: Tensor, fused: bool) -> f64 {
+    let samples: List<f64> = [];
+    var index: i64 = 0;
+    while index < 23 {
+        gc_collect();
+        var result = zeros([0]);
+        let start = clock();
+        if fused {
+            result = fused_affine_relu(input, 2.0, 1.0);
+        } else {
+            let scaled = scale(input, 2.0);
+            let shifted = add(scaled, full([], 1.0));
+            result = relu(shifted);
+        }
+        let elapsed = clock() - start;
+        assert(item(result, 99999) == 2.0, "逐元素基准结果错误");
+        if index >= 3 {
+            push(samples, elapsed);
+        }
+        index += 1;
+    }
+    return bench_median(samples);
+}
+
+fn bench_buffer_cycle() -> void {
+    let value = full([100000], 0.5);
+    assert(item(value, 99999) == 0.5, "复用缓冲区内容错误");
+}
+
+fn bench_buffers() -> void {
+    gc_collect();
+    trim_buffers();
+    let logical = allocation_count();
+    let physical = system_allocation_count();
+    let reused = buffer_reuse_count();
+    var index: i64 = 0;
+    while index < 100 {
+        bench_buffer_cycle();
+        gc_collect();
+        index += 1;
+    }
+    let logical_used = allocation_count() - logical;
+    let physical_used = system_allocation_count() - physical;
+    let reuse_used = buffer_reuse_count() - reused;
+    assert(reuse_used >= 99, "缓冲区基准必须实际复用存储");
+    assert(physical_used < logical_used, "复用必须减少系统分配");
+    print("100 次张量创建的逻辑分配、系统分配与存储复用次数");
+    print(logical_used);
+    print(physical_used);
+    print(reuse_used);
+    print("缓冲池保留字节数");
+    print(cached_memory_bytes());
+    trim_buffers();
+    assert(cached_memory_bytes() == 0, "基准结束应归还缓存");
+}
+
+fn main() -> void {
+    print("基准配置：f64，原生 O2，单线程，3 次预热、20 次计时取中位数");
+    set_threads(1);
+    let plain128 = bench_matrix(128, false);
+    let fast128 = bench_matrix(128, true);
+    let plain256 = bench_matrix(256, false);
+    let fast256 = bench_matrix(256, true);
+    print("128x128 单线程朴素内核中位秒数");
+    print(plain128);
+    print("128x128 单线程优化内核中位秒数");
+    print(fast128);
+    print("256x256 单线程朴素内核中位秒数");
+    print(plain256);
+    print("256x256 单线程优化内核中位秒数");
+    print(fast256);
+    let input = full([100000], 0.5);
+    gc_collect();
+    let before = allocation_count();
+    let scaled = scale(input, 2.0);
+    let shifted = add(scaled, full([], 1.0));
+    let reference = relu(shifted);
+    let separate = allocation_count() - before;
+    let before_fused = allocation_count();
+    let fused = fused_affine_relu(input, 2.0, 1.0);
+    let combined = allocation_count() - before_fused;
+    assert_close(reference, fused, 0.0, 0.0);
+    print("逐元素计算分配次数：表达式路径与显式融合路径");
+    print(separate);
+    print(combined);
+    print("100000 元素 f64 单线程分离路径与融合路径中位秒数");
+    print(bench_elementwise(input, false));
+    print(bench_elementwise(input, true));
+    bench_buffers();
+    print("运行时跟踪的峰值内存字节数");
+    print(peak_memory_bytes());
+}

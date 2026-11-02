@@ -1,0 +1,171 @@
+import "../../heng/heng.heng";
+
+fn nn_fixture_linear() {
+    let tape=ag_tape();
+    let layer=nn_linear(tape,2,2,true);
+    ag_assign(tape,layer.parameters[0],tensor([1.0,2.0,3.0,4.0],[2,2]));
+    ag_assign(tape,layer.parameters[1],tensor([0.5,-0.5],[2]));
+    let input=ag_variable(tape,tensor([1.0,2.0,3.0,4.0],[2,2]),true);
+    let output=nn_forward(tape,layer,input);
+    assert_close(ag_value(tape,output),tensor([7.5,9.5,15.5,21.5],[2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([3.0,7.0,3.0,7.0],[2,2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[0]),tensor([4.0,4.0,6.0,6.0],[2,2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[1]),tensor([2.0,2.0],[2]),0.000000001,0.000000001);
+    let sequence=nn_sequential();
+    nn_add(sequence,layer);
+    nn_add(sequence,nn_relu());
+    nn_add(sequence,layer);
+    assert(len(nn_parameters(sequence))==2,"共享模块参数应去重");
+    nn_eval(sequence);
+    assert(!layer.training,"推理模式应传播到子模块");
+    nn_train(sequence,true);
+    assert(layer.training,"训练模式应传播到子模块");
+}
+
+fn nn_fixture_embedding() {
+    let tape=ag_tape();
+    let layer=nn_embedding(tape,3,2);
+    ag_assign(tape,layer.parameters[0],reshape(arange(6),[3,2]));
+    let output=nn_embedding_forward(tape,layer,[2,0,2]);
+    assert_close(ag_value(tape,output),tensor([4.0,5.0,0.0,1.0,4.0,5.0],[3,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,layer.parameters[0]),tensor([1.0,1.0,0.0,0.0,2.0,2.0],[3,2]),0.000000001,0.000000001);
+}
+
+fn nn_fixture_conv_pool() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,tensor([1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0],[1,1,3,3]),true);
+    let layer=nn_conv2d(tape,1,1,2,2,1,0,true);
+    nn_init_constant(tape,layer.parameters[0],1.0);
+    let output=nn_forward(tape,layer,input);
+    assert_close(ag_value(tape,output),tensor([12.0,16.0,24.0,28.0],[1,1,2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([1.0,2.0,1.0,2.0,4.0,2.0,1.0,2.0,1.0],[1,1,3,3]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[0]),tensor([12.0,16.0,24.0,28.0],[1,1,2,2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[1]),tensor([4.0],[1]),0.000000001,0.000000001);
+    ag_zero_grad(tape);
+    let average=nn_forward(tape,nn_avg_pool2d(2,2,1,0),input);
+    assert_close(ag_value(tape,average),tensor([3.0,4.0,6.0,7.0],[1,1,2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,average),ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([0.25,0.5,0.25,0.5,1.0,0.5,0.25,0.5,0.25],[1,1,3,3]),0.000000001,0.000000001);
+    ag_zero_grad(tape);
+    let maximum=nn_forward(tape,nn_max_pool2d(2,2,1,0),input);
+    assert_close(ag_value(tape,maximum),tensor([5.0,6.0,8.0,9.0],[1,1,2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,maximum),ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([0.0,0.0,0.0,0.0,1.0,1.0,0.0,1.0,1.0],[1,1,3,3]),0.000000001,0.000000001);
+    let negative=ag_variable(tape,full([1,1,1,1],-2.0),true);
+    let padded=nn_forward(tape,nn_max_pool2d(2,2,1,1),negative);
+    assert_close(ag_value(tape,padded),full([1,1,2,2],-2.0),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,padded),ones([]),false);
+    assert_close(ag_grad(tape,negative),full([1,1,1,1],4.0),0.000000001,0.000000001);
+}
+
+fn nn_fixture_normalization() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,tensor([-1.0,1.0,-1.0,1.0],[2,2]),true);
+    let layer=nn_layer_norm(tape,[2],3.0);
+    let output=nn_forward(tape,layer,input);
+    assert_close(ag_value(tape,output),tensor([-0.5,0.5,-0.5,0.5],[2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,input),zeros([2,2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[0]),tensor([-1.0,1.0],[2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,layer.parameters[1]),full([2],2.0),0.000000001,0.000000001);
+    let batch=nn_batch_norm(tape,2,3.0,0.1);
+    let values=ag_variable(tape,tensor([1.0,3.0,3.0,7.0],[2,2]),true);
+    let normalized=nn_forward(tape,batch,values);
+    let expected=div(tensor([-1.0,-2.0,1.0,2.0],[2,2]),sqrt(tensor([4.0,7.0],[2])));
+    assert_close(ag_value(tape,normalized),expected,0.000000001,0.000000001);
+    assert_close(batch.buffers[0],tensor([0.2,0.5],[2]),0.000000001,0.000000001);
+    assert_close(batch.buffers[1],tensor([1.1,1.7],[2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,normalized),ones([]),false);
+    assert_close(ag_grad(tape,values),zeros([2,2]),0.000000001,0.000000001);
+    nn_eval(batch);
+    let evaluated=nn_forward(tape,batch,values);
+    assert_close(ag_value(tape,evaluated),div(sub(ag_value(tape,values),batch.buffers[0]),sqrt(add(batch.buffers[1],full([],3.0)))),0.000000001,0.000000001);
+}
+
+fn nn_fixture_dropout_activations() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,ones([8]),true);
+    let layer=nn_dropout(0.5);
+    seed(42);
+    let expected=scale(greater(rand([8]),0.5),2.0);
+    seed(42);
+    let output=nn_forward(tape,layer,input);
+    assert_close(ag_value(tape,output),expected,0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    assert_close(ag_grad(tape,input),expected,0.000000001,0.000000001);
+    nn_eval(layer);
+    assert(nn_forward(tape,layer,input)==input,"推理模式 Dropout 应保持输入");
+    let values=ag_variable(tape,tensor([-1.0,0.0,1.0],[3]),true);
+    let activated=nn_forward(tape,nn_relu(),values);
+    ag_backward(tape,ag_sum_all(tape,activated),ones([]),false);
+    assert_close(ag_grad(tape,values),tensor([0.0,0.0,1.0],[3]),0.000000001,0.000000001);
+    let smooth=nn_forward(tape,nn_tanh(),values);
+    assert_close(ag_value(tape,smooth),tanh(ag_value(tape,values)),0.000000001,0.000000001);
+    let logistic=nn_forward(tape,nn_sigmoid(),values);
+    assert_close(ag_value(tape,logistic),sigmoid(ag_value(tape,values)),0.000000001,0.000000001);
+    let gelu=nn_forward(tape,nn_gelu(),values);
+    let gelu_seed=ag_jvp(tape,gelu,[values],[ones([3])]);
+    let gelu_grad=ag_vjp(tape,gelu,ones([3]),[values],false);
+    assert_close(gelu_seed,gelu_grad[0],0.000000001,0.000000001);
+}
+
+fn nn_fixture_recurrent_attention() {
+    let tape=ag_tape();
+    let recurrent=nn_rnn(tape,1,1);
+    nn_init_constant(tape,recurrent.parameters[0],1.0);
+    nn_init_constant(tape,recurrent.parameters[1],1.0);
+    let input=ag_variable(tape,tensor([0.2,0.3],[1,2,1]),true);
+    let output=nn_forward(tape,recurrent,input);
+    let first=tanh(tensor([0.2],[1]));
+    let second=tanh(add(tensor([0.3],[1]),first));
+    assert_close(ag_value(tape,output),reshape(concat(first,second,0),[1,2,1]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,output),ones([]),false);
+    let second_grad=sub(ones([1]),mul(second,second));
+    let first_grad=mul(sub(ones([1]),mul(first,first)),add(ones([1]),second_grad));
+    assert_close(ag_grad(tape,input),reshape(concat(first_grad,second_grad,0),[1,2,1]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,recurrent.parameters[0]),reshape(add(scale(first_grad,0.2),scale(second_grad,0.3)),[1,1]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,recurrent.parameters[1]),reshape(mul(second_grad,first),[1,1]),0.000000001,0.000000001);
+    let attention=nn_multihead_attention(tape,2,1,0.0);
+    for child in attention.children {
+        if child.kind==1 { ag_assign(tape,child.parameters[0],tensor([1.0,0.0,0.0,1.0],[2,2])); }
+    }
+    let query=ag_variable(tape,zeros([1,2,2]),true);
+    let attended=nn_forward(tape,attention,query);
+    assert_close(ag_value(tape,attended),zeros([1,2,2]),0.000000001,0.000000001);
+    ag_backward(tape,ag_sum_all(tape,attended),ones([]),false);
+    assert_close(ag_grad(tape,query),ones([1,2,2]),0.000000001,0.000000001);
+    assert_close(ag_grad(tape,attention.children[3].parameters[1]),full([2],2.0),0.000000001,0.000000001);
+}
+
+fn nn_fixture_losses() {
+    let tape=ag_tape();
+    let input=ag_variable(tape,tensor([1.0,3.0],[2]),true);
+    let target=ag_constant(tape,tensor([2.0,1.0],[2]));
+    let loss=nn_mse_loss(tape,input,target);
+    assert_close(ag_value(tape,loss),tensor([2.5],[]),0.000000001,0.000000001);
+    ag_backward(tape,loss,ones([]),false);
+    assert_close(ag_grad(tape,input),tensor([-1.0,2.0],[2]),0.000000001,0.000000001);
+    let logits=ag_variable(tape,tensor([1000.0,1001.0],[1,2]),true);
+    let entropy=nn_cross_entropy(tape,logits,[1]);
+    assert_close(ag_value(tape,entropy),log(add(ones([]),exp(full([],-1.0)))),0.000000001,0.000000001);
+    ag_backward(tape,entropy,ones([]),false);
+    assert_close(ag_grad(tape,logits),sub(softmax(ag_value(tape,logits),1),tensor([0.0,1.0],[1,2])),0.000000001,0.000000001);
+    let binary=ag_variable(tape,zeros([1]),true);
+    let binary_loss=nn_binary_cross_entropy_logits(tape,binary,ag_constant(tape,ones([1])));
+    ag_backward(tape,binary_loss,ones([]),false);
+    assert_close(ag_grad(tape,binary),full([1],-0.5),0.000000001,0.000000001);
+}
+
+fn main() {
+    nn_fixture_linear();
+    nn_fixture_embedding();
+    nn_fixture_conv_pool();
+    nn_fixture_normalization();
+    nn_fixture_dropout_activations();
+    nn_fixture_recurrent_attention();
+    nn_fixture_losses();
+    print("PASS: 模块、神经网络层、前向值、解析梯度与稳定损失");
+}
