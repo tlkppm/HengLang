@@ -78,6 +78,7 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "set_threads": (["i64"], "void"),
     "get_threads": ([], "i64"),
     "set_optimized": (["bool"], "void"),
+    "set_matmul_fast": (["bool"], "void"),
     "fused_affine_relu": (["Tensor", "f64", "f64"], "Tensor"),
     "gc_collect": ([], "void"),
     "live_objects": ([], "i64"),

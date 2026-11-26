@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,9 +37,12 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
 
 def parse_arguments(arguments=None):
-    parser = JsonArgumentParser(description="HENG 与已安装框架的 f64 CPU 矩阵乘法对比；不安装依赖、不训练，JSON 输出到 stdout")
+    parser = JsonArgumentParser(description="HENG 与已安装框架的 CPU 矩阵乘法对比，支持 f32 与 f64，输出 JSON")
     parser.add_argument("--sizes", type=int, nargs="+", default=[128, 256], help="方阵边长，默认 128 256，允许 2..2048")
     parser.add_argument("--input", choices=INPUT_PROFILES, default="affine", help="输入分布：线性序列、二进制有理数或一般有理数")
+    parser.add_argument("--layout", choices=["contiguous", "right-transposed", "both-transposed"], default="contiguous", help="保持输入值不变，切换矩阵物理存储布局")
+    parser.add_argument("--dtype", choices=["f64", "f32"], default="f64", help="矩阵和结果的数据类型")
+    parser.add_argument("--matmul-fast", action="store_true", help="HENG 对满足条件的浮点矩阵使用融合乘加，允许舍入差异")
     parser.add_argument("--warmup", type=int, default=3, help="预热次数，至少 3")
     parser.add_argument("--repeats", type=int, default=20, help="计时次数，至少 20，取中位数")
     parser.add_argument("--frameworks", choices=["numpy", "torch"], nargs="+", default=["numpy"], help="仅使用已安装的框架，默认 numpy；torch 为可选项")
@@ -74,43 +78,48 @@ def sample_parameters(side):
     return (15731, 7919, 47) if side == "left" else (24851, 1277, 9391)
 
 
-def input_value(size, index, side, profile="affine"):
+def round_input(value, dtype):
+    return struct.unpack("<f", struct.pack("<f", value))[0] if dtype == "f32" else value
+
+
+def input_value(size, index, side, profile="affine", dtype="f64"):
     if not 0 <= index < size * size or side not in ("left", "right"):
         raise BenchmarkError("输入采样位置或矩阵名称无效")
     if profile == "affine":
         left_scale, left_bias, right_scale, right_bias = input_parameters(size)
         scale, bias = (left_scale, left_bias) if side == "left" else (right_scale, right_bias)
-        return index * scale + bias
+        return round_input(index * scale + bias, dtype)
     slope, divisor_slope, seed = sample_parameters(side)
     numerator = (index * slope + seed) % 65521 - 32760
     denominator = 65536 if profile == "dyadic" else 65521 + (index * divisor_slope + seed) % 65519
-    return numerator / denominator
+    return round_input(numerator / denominator, dtype)
 
 
 def sample_positions(size):
     return sorted({0, size - 1, (size // 2) * size + size // 2, size * size - size, size * size - 1})
 
 
-def reference_samples(size, profile="affine"):
+def reference_samples(size, profile="affine", dtype="f64"):
     return [
         math.fsum(
-            input_value(size, (index // size) * size + inner, "left", profile)
-            * input_value(size, inner * size + index % size, "right", profile)
+            input_value(size, (index // size) * size + inner, "left", profile, dtype)
+            * input_value(size, inner * size + index % size, "right", profile, dtype)
             for inner in range(size)
         )
         for index in sample_positions(size)
     ]
 
 
-def validate_samples(actual, expected, label):
+def validate_samples(actual, expected, label, dtype="f64"):
+    rtol, atol = (2e-5, 2e-5) if dtype == "f32" else (1e-10, 1e-11)
     if len(actual) != len(expected):
         raise BenchmarkError(label + "的校验样本数量不匹配")
     errors = []
     for value, reference in zip(actual, expected):
-        if not math.isfinite(value) or not math.isclose(value, reference, rel_tol=1e-10, abs_tol=1e-11):
+        if not math.isfinite(value) or not math.isclose(value, reference, rel_tol=rtol, abs_tol=atol):
             raise BenchmarkError(label + "未通过独立数值校验")
         errors.append(abs(value - reference))
-    return {"status": "PASS", "samples": actual, "max_absolute_error": max(errors, default=0.0), "rtol": 1e-10, "atol": 1e-11}
+    return {"status": "PASS", "samples": actual, "max_absolute_error": max(errors, default=0.0), "rtol": rtol, "atol": atol}
 
 
 def summarize_timings(values, repeats):
@@ -136,10 +145,20 @@ def heng_inputs(size, profile):
     return "\n    ".join(lines)
 
 
-def heng_source(size, warmup, repeats, profile="affine"):
+def heng_source(size, warmup, repeats, profile="affine", layout="contiguous", fast=False, dtype="f64"):
     validate_configuration([size], warmup, repeats)
     positions = sample_positions(size)
-    inputs = "\n".join(f'print(item({side}, {index}));' for side in ("left", "right") for index in positions)
+    sides = ("left", "right")
+    bindings = []
+    for side in sides:
+        transposed = layout == "both-transposed" or (layout == "right-transposed" and side == "right")
+        tensor = f'cast({side}, "f32")' if dtype == "f32" else side
+        if transposed:
+            tensor = f"transpose(clone(transpose({tensor}, [1, 0])), [1, 0])"
+        bindings.append(f"let {side}_operand = {tensor};")
+    operands = "\n    ".join(bindings)
+    set_mode = "set_matmul_fast(true);" if fast else ""
+    inputs = "\n".join(f'print(item({side}_operand, {index}));' for side in sides for index in positions)
     outputs = "\n".join(f'print(item(result, {index}));' for index in positions)
     return f'''fn trial(left: Tensor, right: Tensor) -> f64 {{
     let start = clock();
@@ -150,31 +169,33 @@ def heng_source(size, warmup, repeats, profile="affine"):
 }}
 fn verify(left: Tensor, right: Tensor) -> void {{
     let result = matmul(left, right);
-    assert(dtype(result) == "f64", "矩阵乘法输出必须是 f64");
+    assert(dtype(result) == "{dtype}", "矩阵乘法输出精度错误");
     print("HENG_OUTPUT_V1");
     {outputs}
 }}
 fn main() -> void {{
     set_threads(1);
     set_optimized(true);
+    {set_mode}
     print("HENG_THREADS_V1");
     print(get_threads());
     {heng_inputs(size, profile)}
-    assert(dtype(left) == "f64" && dtype(right) == "f64", "输入必须是 f64");
+    {operands}
+    assert(dtype(left_operand) == "{dtype}" && dtype(right_operand) == "{dtype}", "矩阵乘法输入精度错误");
     print("HENG_INPUT_V1");
     {inputs}
-    verify(left, right);
+    verify(left_operand, right_operand);
     var warm: i64 = 0;
     while warm < {warmup} {{
         gc_collect();
-        let elapsed = trial(left, right);
+        let elapsed = trial(left_operand, right_operand);
         warm += 1;
     }}
     let samples: List<f64> = [];
     var index: i64 = 0;
     while index < {repeats} {{
         gc_collect();
-        let elapsed = trial(left, right);
+        let elapsed = trial(left_operand, right_operand);
         push(samples, elapsed);
         index += 1;
     }}
@@ -189,7 +210,7 @@ fn main() -> void {{
 '''
 
 
-def parse_heng_output(text, size, repeats, profile="affine"):
+def parse_heng_output(text, size, repeats, profile="affine", dtype="f64"):
     lines = text.splitlines()
     count = len(sample_positions(size))
     expected_length = 6 + 3 * count + repeats
@@ -213,9 +234,9 @@ def parse_heng_output(text, size, repeats, profile="affine"):
         timings = [float(value) for value in lines[3 + 3 * count:-1]]
     except ValueError:
         raise BenchmarkError("HENG 输出包含无效数值") from None
-    expected_inputs = [input_value(size, index, side, profile) for side in ("left", "right") for index in sample_positions(size)]
+    expected_inputs = [input_value(size, index, side, profile, dtype) for side in ("left", "right") for index in sample_positions(size)]
     input_check = validate_samples(inputs, expected_inputs, "HENG 输入")
-    output_check = validate_samples(outputs, reference_samples(size, profile), "HENG 输出")
+    output_check = validate_samples(outputs, reference_samples(size, profile, dtype), "HENG 输出", dtype)
     return {**summarize_timings(timings, repeats), "input_validation": input_check, "validation": output_check, "threads": threads}
 
 
@@ -349,17 +370,24 @@ def create_inputs(module, name, size, profile):
     return matrices
 
 
-def framework_benchmark(module, name, size, warmup, repeats, profile="affine"):
+def framework_benchmark(module, name, size, warmup, repeats, profile="affine", layout="contiguous", dtype="f64"):
     left, right = create_inputs(module, name, size, profile)
+    precision = module.float64 if dtype == "f64" else module.float32
+    if dtype == "f32":
+        left, right = [matrix.astype(precision) if name == "numpy" else matrix.to(precision) for matrix in (left, right)]
+    if layout != "contiguous":
+        right = right.T.copy().T if name == "numpy" else right.T.contiguous().T
+    if layout == "both-transposed":
+        left = left.T.copy().T if name == "numpy" else left.T.contiguous().T
     positions = sample_positions(size)
     actual_inputs = [float(matrix.reshape(-1)[index]) for matrix in (left, right) for index in positions]
-    expected_inputs = [input_value(size, index, side, profile) for side in ("left", "right") for index in positions]
+    expected_inputs = [input_value(size, index, side, profile, dtype) for side in ("left", "right") for index in positions]
     input_check = validate_samples(actual_inputs, expected_inputs, name + " 输入")
     result = module.matmul(left, right)
-    if result.dtype != module.float64 or tuple(result.shape) != (size, size):
+    if result.dtype != precision or tuple(result.shape) != (size, size):
         raise BenchmarkError(name + " 输出形状或精度错误")
-    expected_outputs = reference_samples(size, profile)
-    validation = validate_samples([float(result.reshape(-1)[index]) for index in positions], expected_outputs, name + " 输出")
+    expected_outputs = reference_samples(size, profile, dtype)
+    validation = validate_samples([float(result.reshape(-1)[index]) for index in positions], expected_outputs, name + " 输出", dtype)
     del result
     before = threadpool_information()
     times = []
@@ -373,7 +401,7 @@ def framework_benchmark(module, name, size, warmup, repeats, profile="affine"):
             elapsed = (time.perf_counter_ns() - start) * 1e-9
             if index >= warmup:
                 times.append(elapsed)
-            validate_samples([float(result.reshape(-1)[position]) for position in positions], expected_outputs, name + " 迭代输出")
+            validate_samples([float(result.reshape(-1)[position]) for position in positions], expected_outputs, name + " 迭代输出", dtype)
             del result
     finally:
         if was_enabled:
@@ -404,7 +432,8 @@ def blas_metadata(frameworks):
 
 def run_heng(directory, size, args):
     source = Path(directory) / f"matmul_{size}.heng"
-    source.write_text(heng_source(size, args.warmup, args.repeats, args.input), encoding="utf-8", newline="\n")
+    source.write_text(heng_source(size, args.warmup, args.repeats, args.input, args.layout, args.matmul_fast, args.dtype),
+                      encoding="utf-8", newline="\n")
     command = [sys.executable, "-B", "-m", "henglang", "run", str(source), "--timeout", str(args.timeout)]
     try:
         result = subprocess.run(command, cwd=ROOT, env=os.environ.copy(), capture_output=True,
@@ -413,7 +442,7 @@ def run_heng(directory, size, args):
         raise BenchmarkError("HENG 构建及执行超过总超时；未形成有效计时结果") from None
     if result.returncode:
         raise BenchmarkError("HENG 构建或执行失败；为保护本地路径，不转发原始诊断，请单独使用项目 CLI 排查")
-    return parse_heng_output(result.stdout, size, args.repeats, args.input)
+    return parse_heng_output(result.stdout, size, args.repeats, args.input, args.dtype)
 
 
 def single_thread_configuration_verified(results):
@@ -446,12 +475,13 @@ def run(args):
     report = {
         "schema_version": 1,
         "status": "PASS",
-        "scope": "仅 f64 CPU 稠密方阵 matmul；不是完整框架、训练、GPU、能耗或算力节省结论",
+        "scope": "CPU 稠密方阵 matmul 的算子级比较",
         "privacy": {"machine_information": "omitted"},
         "versions": {"frameworks": {name: str(module.__version__) for name, module in frameworks.items()},
                      "heng_runtime_sha256": identity, "heng_compiler": "Zig " + VERSION},
-        "parameters": {"sizes": args.sizes, "dtype": "f64", "device": "cpu", "warmup": args.warmup,
-                       "input_profile": args.input, "repeats": args.repeats, "statistic": "median", "requested_threads": 1,
+        "parameters": {"sizes": args.sizes, "dtype": args.dtype, "device": "cpu", "warmup": args.warmup,
+                       "input_profile": args.input, "input_layout": args.layout, "heng_matmul_fast": args.matmul_fast,
+                       "repeats": args.repeats, "statistic": "median", "requested_threads": 1,
                        "timeout_seconds": args.timeout, "build_and_run_timeout_seconds": args.build_timeout},
         "method": {"operation": "C = matmul(A, B)，每次调用创建新输出，不使用 out 参数",
                    "inputs": {"affine": "i = arange(n*n), A = reshape(i*(1/(n*n))-0.5), B = reshape(i*(-0.75/(n*n))+0.25)",
@@ -477,9 +507,9 @@ def run(args):
         for size in args.sizes:
             heng = run_heng(directory, size, args)
             row = {"shape": [size, size], "sample_flat_indices": sample_positions(size),
-                   "reference_samples": reference_samples(size, args.input), "heng": heng, "frameworks": {}}
+                   "reference_samples": reference_samples(size, args.input, args.dtype), "heng": heng, "frameworks": {}}
             for name, module in frameworks.items():
-                row["frameworks"][name] = framework_benchmark(module, name, size, args.warmup, args.repeats, args.input)
+                row["frameworks"][name] = framework_benchmark(module, name, size, args.warmup, args.repeats, args.input, args.layout, args.dtype)
                 row["frameworks"][name]["ratio_framework_over_heng"] = row["frameworks"][name]["median_seconds"] / heng["median_seconds"]
                 row["frameworks"][name]["ratio_interpretation"] = "大于 1 仅表示本次该算子 HENG 更快；线程配置匹配见 fair_single_thread，该标记不保证 CPU 调度隔离或完全公平"
             report["results"].append(row)

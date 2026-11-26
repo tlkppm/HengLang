@@ -71,9 +71,15 @@ python -B benchmarks/compare_frameworks.py --help
 python -B benchmarks/compare_frameworks.py
 ```
 
-The comparison driver uses an already installed library and checks numerical samples. In three verified single-thread runs, HENG led NumPy/OpenBLAS on exact binary-fraction `f64` matrices at both tested sizes. NumPy/OpenBLAS led on general floating-point inputs, and the original affine test at the larger size had mixed results. See the benchmark details for the per-run results and the conditions under which HENG can use exact accumulation.
+The comparison driver uses an already installed library and checks numerical samples. It covers `f32` and `f64`, contiguous matrices, and transposed physical layouts. HENG preserves compensated accumulation by default. Call `set_matmul_fast(true)` or pass `--matmul-fast` to the comparison driver to allow fused multiply-add on eligible inputs. The measured lead depends on the precision, layout, and selected mode. See [benchmark results](BENCHMARKS.md).
 
-A general claim that HENG exceeds PyTorch, TensorFlow, JAX, or all existing frameworks is unproven. No model has been trained for this delivery, and no equal-quality training-cost advantage has been established.
+### Character model training
+
+```powershell
+python -B benchmarks/train_text_model.py --numpy --heng-matmul fast
+```
+
+The experiment trains a next-character model on locally generated English sentences. It reports loss, perplexity, prediction accuracy, and generated text for a held-out set of sentence combinations, with separate scores for context-and-target pairs absent from training. The optional NumPy baseline uses the same initialization, model, batches, and optimizer. See [training results and scope](BENCHMARKS.md).
 
 ### Current boundaries
 

@@ -71,9 +71,15 @@ python -B benchmarks/compare_frameworks.py --help
 python -B benchmarks/compare_frameworks.py
 ```
 
-比较程序使用已有的比较库，并校验输入和输出样本。在已核验单线程配置的三轮测试中，HENG 对两种规模的精确二进制分数 `f64` 矩阵均领先 NumPy/OpenBLAS。一般浮点输入仍由 NumPy/OpenBLAS 领先，较大规模的原始仿射输入则有输有赢。各轮耗时和精确累加的适用条件见基准说明。
+比较程序使用已有的比较库，并校验数值样本。它覆盖 `f32`、`f64`、连续矩阵与转置存储布局。HENG 默认保留补偿累加。调用 `set_matmul_fast(true)` 或为比较程序传入 `--matmul-fast`，可允许符合条件的输入使用融合乘加。实测领先情况取决于精度、布局和运行模式。详见[基准结果](BENCHMARKS.md)。
 
-HENG 全面超越 PyTorch、TensorFlow、JAX 或所有现有框架的说法尚未得到证明。本次交付没有训练模型，也没有建立达到相同模型质量时训练成本更低的证据。
+### 字符模型训练
+
+```powershell
+python -B benchmarks/train_text_model.py --numpy --heng-matmul fast
+```
+
+实验使用本地合成英文短句训练下一字符预测模型。它报告留出句子组合的损失、困惑度、预测准确率和生成文本，并单独评分训练中未见过的上下文与目标字符组合。可选 NumPy 基线使用相同的初始化、模型、批次和优化器。详见[训练结果与适用范围](BENCHMARKS.md)。
 
 ### 当前边界
 

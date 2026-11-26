@@ -1,0 +1,189 @@
+import "nn/losses.heng";
+import "optim/optimizers.heng";
+import "data.heng";
+
+struct TextModelConfig {
+    vocabulary: i64,
+    context: i64,
+    hidden: i64,
+    batch_size: i64,
+    epochs: i64,
+    seed: i64,
+    shuffle_seed: i64,
+    input_scale: f64,
+    output_scale: f64,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    generation_length: i64,
+    timed: bool
+}
+
+struct TextModelDataset {
+    inputs: Tensor,
+    targets: Tensor
+}
+
+fn text_model_dataset(tokens: List<i64>, config: TextModelConfig) -> TextModelDataset {
+    let inputs = zeros([len(tokens), config.context * config.vocabulary]);
+    let targets = zeros([len(tokens)]);
+    var row: i64 = 0;
+    var sentence_start: i64 = 0;
+    for target in tokens {
+        var position: i64 = 0;
+        while position < config.context {
+            let source = row - config.context + position;
+            var token: i64 = 0;
+            if source >= sentence_start { token = tokens[source]; }
+            set(inputs, [row, position * config.vocabulary + token], 1.0);
+            position += 1;
+        }
+        set(targets, [row], f64(target));
+        if target == 0 { sentence_start = row + 1; }
+        row += 1;
+    }
+    return TextModelDataset { inputs: inputs, targets: targets };
+}
+
+fn text_model_labels(targets: Tensor) -> List<i64> {
+    let labels: List<i64> = [];
+    var index: i64 = 0;
+    while index < numel(targets) {
+        push(labels, i64(item(targets, index)));
+        index += 1;
+    }
+    return labels;
+}
+
+fn text_model_weights(rows: i64, columns: i64, seed: i64, amplitude: f64) -> Tensor {
+    let weights = zeros([rows, columns]);
+    var state = seed;
+    var row: i64 = 0;
+    while row < rows {
+        var column: i64 = 0;
+        while column < columns {
+            state = (state * 48271) % 2147483647;
+            let sample = 2.0 * (f64(state) / 2147483647.0) - 1.0;
+            set(weights, [row, column], sample * amplitude);
+            column += 1;
+        }
+        row += 1;
+    }
+    return weights;
+}
+
+fn text_model_logits(tape: AGTape, parameters: List<i64>, inputs: Tensor) -> i64 {
+    let input = ag_constant(tape, inputs);
+    let hidden = ag_tanh(tape, ag_add(tape, ag_matmul(tape, input, parameters[0]), parameters[1]));
+    return ag_add(tape, ag_matmul(tape, hidden, parameters[2]), parameters[3]);
+}
+
+fn text_model_metrics(tape: AGTape, parameters: List<i64>, dataset: TextModelDataset) {
+    let previous = ag_set_enabled(tape, false);
+    let logits = text_model_logits(tape, parameters, dataset.inputs);
+    let labels = text_model_labels(dataset.targets);
+    let loss = nn_cross_entropy(tape, logits, labels);
+    let predictions = argmax(ag_value(tape, logits), 1);
+    var correct: i64 = 0;
+    var index: i64 = 0;
+    for label in labels {
+        if i64(item(predictions, index)) == label { correct += 1; }
+        index += 1;
+    }
+    print(item(ag_value(tape, loss), 0));
+    print(f64(correct) / f64(len(labels)));
+    ag_clear_graph(tape, parameters);
+    let restored = ag_set_enabled(tape, previous);
+}
+
+fn text_model_train(tape: AGTape, parameters: List<i64>, dataset: TextModelDataset, config: TextModelConfig) -> f64 {
+    let optimizer = opt_adam(tape, parameters, config.learning_rate, config.beta1, config.beta2, config.epsilon, 0.0);
+    let loader = data_loader(dataset.inputs, dataset.targets, config.batch_size, true, false, config.shuffle_seed);
+    var start = 0.0;
+    if config.timed { start = clock(); }
+    var epoch: i64 = 0;
+    while epoch < config.epochs {
+        if epoch > 0 { data_begin_epoch(loader); }
+        while data_has_next(loader) {
+            let batch = data_next(loader);
+            opt_zero_grad(tape, optimizer);
+            let logits = text_model_logits(tape, parameters, batch.inputs);
+            let loss = nn_cross_entropy(tape, logits, text_model_labels(batch.targets));
+            ag_backward(tape, loss, ones([]), false);
+            opt_step(tape, optimizer);
+            ag_clear_graph(tape, parameters);
+        }
+        epoch += 1;
+    }
+    if config.timed { return clock() - start; }
+    return 0.0;
+}
+
+fn text_model_generate(tape: AGTape, parameters: List<i64>, prompt: List<i64>, offset: i64, config: TextModelConfig) -> List<i64> {
+    let previous = ag_set_enabled(tape, false);
+    let window: List<i64> = [];
+    let generated: List<i64> = [];
+    var index: i64 = 0;
+    while index < config.context {
+        push(window, prompt[offset + index]);
+        index += 1;
+    }
+    while len(generated) < config.generation_length {
+        let inputs = zeros([1, config.context * config.vocabulary]);
+        index = 0;
+        while index < config.context {
+            set(inputs, [0, index * config.vocabulary + window[index]], 1.0);
+            index += 1;
+        }
+        let logits = text_model_logits(tape, parameters, inputs);
+        let token = i64(item(argmax(ag_value(tape, logits), 1), 0));
+        ag_clear_graph(tape, parameters);
+        push(generated, token);
+        if token == 0 { break; }
+        index = 0;
+        while index + 1 < config.context {
+            window[index] = window[index + 1];
+            index += 1;
+        }
+        window[index] = token;
+    }
+    let restored = ag_set_enabled(tape, previous);
+    return generated;
+}
+
+fn text_model_run(train_tokens: List<i64>, validation_tokens: List<i64>, unseen_indices: List<i64>, prompts: List<i64>, config: TextModelConfig) {
+    assert(get_threads() == 1, "文本模型要求单线程");
+    let train = text_model_dataset(train_tokens, config);
+    let validation = text_model_dataset(validation_tokens, config);
+    let unseen = TextModelDataset {
+        inputs: gather(validation.inputs, unseen_indices, 0),
+        targets: gather(validation.targets, unseen_indices, 0)
+    };
+    let tape = ag_tape();
+    let input_width = config.context * config.vocabulary;
+    let input_weights = text_model_weights(input_width, config.hidden, config.seed, config.input_scale);
+    let output_weights = text_model_weights(config.hidden, config.vocabulary, config.seed + 1, config.output_scale);
+    let parameters = [
+        ag_variable(tape, input_weights, true),
+        ag_variable(tape, zeros([config.hidden]), true),
+        ag_variable(tape, output_weights, true),
+        ag_variable(tape, zeros([config.vocabulary]), true)
+    ];
+    print("HENG_TEXT_MODEL_V2");
+    print(get_threads());
+    text_model_metrics(tape, parameters, train);
+    text_model_metrics(tape, parameters, validation);
+    text_model_metrics(tape, parameters, unseen);
+    let seconds = text_model_train(tape, parameters, train, config);
+    text_model_metrics(tape, parameters, train);
+    text_model_metrics(tape, parameters, validation);
+    text_model_metrics(tape, parameters, unseen);
+    print(seconds);
+    var offset: i64 = 0;
+    while offset < len(prompts) {
+        print(text_model_generate(tape, parameters, prompts, offset, config));
+        offset += config.context;
+    }
+    print("HENG_TEXT_MODEL_END_V1");
+}

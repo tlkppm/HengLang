@@ -157,6 +157,18 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                                       for inner in range(size)) for row, col in map(lambda index: divmod(index, size), positions)]
                 self.assertEqual(benchmark.reference_samples(size, profile), expected)
 
+    def test_fast_transposed_workload_uses_matching_logical_inputs(self):
+        from henglang.frontend import check, parse
+        args = benchmark.parse_arguments(["--sizes", "16", "--input", "rational", "--layout", "both-transposed", "--matmul-fast"])
+        self.assertTrue(args.matmul_fast)
+        self.assertEqual(args.layout, "both-transposed")
+        source = benchmark.heng_source(16, 3, 20, args.input, args.layout, args.matmul_fast)
+        self.assertIn("main", check(parse(source, "comparison.heng")).functions)
+        for side in ("left", "right"):
+            self.assertIn(f"let {side}_operand = transpose(clone(transpose({side}, [1, 0])), [1, 0]);", source)
+        self.assertIn("set_matmul_fast(true);", source)
+        self.assertIn("trial(left_operand, right_operand)", source)
+
     def test_help_needs_no_optional_dependencies_or_project_imports(self):
         result = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "benchmarks" / "compare_frameworks.py"), "--help"],
                                 cwd=ROOT, capture_output=True, encoding="utf-8", timeout=15)

@@ -104,6 +104,12 @@ fn opt_step(tape:AGTape,optimizer:OPTOptimizer) {
         assert(ag_same_shape(shape(node.grad),shape(node.data)),"参数梯度形状错误");
     }
     optimizer.steps=optimizer.steps+1;
+    var first_correction=1.0;
+    var second_correction=1.0;
+    if len(optimizer.parameters)>0 && (optimizer.kind==1 || optimizer.kind==2) {
+        first_correction=1.0/(1.0-opt_scalar_power(optimizer.beta1,optimizer.steps));
+        second_correction=1.0/(1.0-opt_scalar_power(optimizer.beta2,optimizer.steps));
+    }
     var index:i64=0;
     for parameter in optimizer.parameters {
         let value=ag_value(tape,parameter);
@@ -122,8 +128,8 @@ fn opt_step(tape:AGTape,optimizer:OPTOptimizer) {
             if optimizer.kind==1 || optimizer.kind==2 {
                 optimizer.first[index]=add(scale(optimizer.first[index],optimizer.beta1),scale(gradient,1.0-optimizer.beta1));
                 optimizer.second[index]=add(scale(optimizer.second[index],optimizer.beta2),scale(mul(gradient,gradient),1.0-optimizer.beta2));
-                let first=scale(optimizer.first[index],1.0/(1.0-opt_scalar_power(optimizer.beta1,optimizer.steps)));
-                let second=scale(optimizer.second[index],1.0/(1.0-opt_scalar_power(optimizer.beta2,optimizer.steps)));
+                let first=scale(optimizer.first[index],first_correction);
+                let second=scale(optimizer.second[index],second_correction);
                 update=div(first,add(sqrt(second),full([],optimizer.epsilon)));
             }
             else {

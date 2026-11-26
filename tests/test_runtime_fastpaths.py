@@ -105,13 +105,29 @@ class RuntimeFastpathTests(unittest.TestCase):
             a = tensor([0.0] * inner + left, [rows + 1, inner])
             b = tensor(right, [inner, columns])
             expected = tensor(reference, [rows, columns])
+            reference_f32 = matrix_reference([rounded(value, "f32") for value in left],
+                                             [rounded(value, "f32") for value in right], rows, inner, columns, "f32")
+            expected_f32 = tensor(reference_f32, [rows, columns], "f32")
             cases.append(f'''{{
     let a = slice({a}, 0, 1, {rows + 1}, 1);
     let b = {b};
     let expected = {expected};
+    let packed_a = transpose(clone(transpose(a, [1, 0])), [1, 0]);
+    let packed_b = transpose(clone(transpose(b, [1, 0])), [1, 0]);
+    let first_f32 = cast(a, "f32");
+    let second_f32 = cast(b, "f32");
+    let expected_f32 = {expected_f32};
     for workers in [1, 2, 4] {{
         set_threads(workers);
         assert_close(matmul(a, b), expected, 0.0, 0.0);
+        assert_close(matmul(a, packed_b), expected, 0.0, 0.0);
+        assert_close(matmul(packed_a, packed_b), expected, 0.0, 0.0);
+        assert_close(matmul(first_f32, second_f32), expected_f32, 0.0, 0.0);
+        set_matmul_fast(true);
+        assert_close(matmul(a, b), expected, 0.000000000001, 0.000000000001);
+        assert_close(matmul(packed_a, packed_b), expected, 0.000000000001, 0.000000000001);
+        assert_close(matmul(first_f32, second_f32), expected_f32, 0.00002, 0.00002);
+        set_matmul_fast(false);
     }}
 }}''')
         self.run_heng("set_optimized(true);\n" + "\n".join(cases))
@@ -133,6 +149,26 @@ class RuntimeFastpathTests(unittest.TestCase):
             expected.append([value] * (rows * columns))
         output = self.run_heng("set_optimized(true);" + "".join(sources)).stdout
         self.assert_printed(output, expected)
+
+    def test_matrix_broadcast_and_reductions_match_strided_reference(self):
+        self.run_heng('''
+let matrix = reshape(arange(12), [3, 4]);
+let reverse = slice(matrix, 0, 2, -1, -1);
+let bias = tensor([0.5, -1.0, 2.0, 3.0], [4]);
+let row = tensor([2.0, -1.0, 0.5], [3, 1]);
+let expected = tensor([8.5, 8.0, 12.0, 14.0, 4.5, 4.0, 8.0, 10.0, 0.5, 0.0, 4.0, 6.0], [3, 4]);
+assert_close(add(reverse, bias), expected, 0.0, 0.0);
+assert_close(sub(bias, reverse), sub(clone(broadcast_to(bias, [3, 4])), clone(reverse)), 0.0, 0.0);
+assert_close(mul(reverse, row), mul(clone(reverse), clone(broadcast_to(row, [3, 4]))), 0.0, 0.0);
+assert_close(reduce_to_shape(matrix, [4]), tensor([12.0, 15.0, 18.0, 21.0], [4]), 0.0, 0.0);
+assert_close(reduce_to_shape(matrix, [1, 4]), sum(matrix, 0, true), 0.0, 0.0);
+assert_close(reduce_to_shape(matrix, [3, 4]), matrix, 0.0, 0.0);
+assert_close(sum(matrix, 1, false), tensor([6.0, 22.0, 38.0], [3]), 0.0, 0.0);
+assert_close(mean(matrix, 1, true), tensor([1.5, 5.5, 9.5], [3, 1]), 0.0, 0.0);
+assert_close(max(matrix, 1, false), tensor([3.0, 7.0, 11.0], [3]), 0.0, 0.0);
+assert_close(argmax(matrix, 1), full([3], 3.0), 0.0, 0.0);
+assert(i64(item(argmax(tensor([1.0, f64("nan"), 2.0, f64("nan")], [4]), 0), 0)) == 3, "归约 NaN 索引错误");
+''')
 
     def test_matmul_strided_transposed_and_offset_views(self):
         first = [float(index % 17 - 8) / 8 for index in range(6 * 35)]
@@ -251,11 +287,20 @@ let general = rand([19, 18]);
 set_optimized(false);
 let exact_expected = matmul(a, b);
 let general_expected = matmul(general, b);
+let general_f32 = cast(general, "f32");
+let b_f32 = cast(b, "f32");
+let expected_f32 = matmul(general_f32, b_f32);
+let transposed_general = transpose(clone(transpose(general, [1, 0])), [1, 0]);
+let transposed_b = transpose(clone(transpose(b, [1, 0])), [1, 0]);
 set_optimized(true);
 for workers in [1, 4] {
     set_threads(workers);
     assert_close(matmul(a, b), exact_expected, 0.0, 0.0);
     assert_close(matmul(general, b), general_expected, 0.0, 0.0);
+    set_matmul_fast(true);
+    assert_close(matmul(transposed_general, transposed_b), general_expected, 0.000000000001, 0.000000000001);
+    assert_close(matmul(general_f32, b_f32), expected_f32, 0.00002, 0.00002);
+    set_matmul_fast(false);
 }
 print("PASS fastpath UBSan");''')
         directory = ROOT / ".build" / "test-sources"
