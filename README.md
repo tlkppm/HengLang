@@ -71,7 +71,7 @@ python -B benchmarks/compare_frameworks.py --help
 python -B benchmarks/compare_frameworks.py
 ```
 
-The comparison driver requires an already installed supported comparison library and does not install dependencies. It checks numerical samples before reporting timings. Comparisons are operator-level measurements, not whole-framework rankings. In the recorded local tests, NumPy with OpenBLAS was faster than HENG on both tested matrix sizes; HENG did not exceed that baseline.
+The comparison driver uses an already installed library and checks numerical samples. In three verified single-thread runs, HENG led NumPy/OpenBLAS on exact binary-fraction `f64` matrices at both tested sizes. NumPy/OpenBLAS led on general floating-point inputs, and the original affine test at the larger size had mixed results. See the benchmark details for the per-run results and the conditions under which HENG can use exact accumulation.
 
 A general claim that HENG exceeds PyTorch, TensorFlow, JAX, or all existing frameworks is unproven. No model has been trained for this delivery, and no equal-quality training-cost advantage has been established.
 

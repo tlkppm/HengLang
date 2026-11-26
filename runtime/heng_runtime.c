@@ -7,6 +7,10 @@
 #include <float.h>
 #include <errno.h>
 #include <time.h>
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -184,14 +188,17 @@ static size_t dtype_size(int dtype) { switch(dtype) { case D_F64:return sizeof(d
 static const char *dtype_name(int dtype) { switch(dtype) { case D_F64:return "f64"; case D_F32:return "f32"; case D_I64:return "i64"; case D_BOOL:return "bool"; } hv_fail("无效 dtype"); return ""; }
 static int parse_dtype(const char *name) { if(!strcmp(name,"f64"))return D_F64; if(!strcmp(name,"f32"))return D_F32; if(!strcmp(name,"i64"))return D_I64; if(!strcmp(name,"bool"))return D_BOOL; hv_fail("未知 dtype");return 0; }
 static int64_t shape_count(int64_t rank,const int64_t *shape) { int empty=0; for(int64_t axis=0;axis<rank;axis++) { if(shape[axis]<0)hv_fail("负张量维度"); if(!shape[axis])empty=1; } if(empty)return 0;int64_t count=1; for(int64_t axis=0;axis<rank;axis++) count=mul_i64(count,shape[axis]); return count; }
-static HValue tensor_new(int64_t rank,const int64_t *shape,int dtype) {
+static HValue tensor_allocate(int64_t rank,const int64_t *shape,int dtype,int zero){
     if(rank<0)hv_fail("张量 rank 不能为负"); int64_t count=shape_count(rank,shape);
     HValue value=object_value(H_TENSOR); HObject *tensor=value.as.obj; tensor->as.tensor.rank=rank;tensor->as.tensor.count=count;
     tensor->as.tensor.shape=allocate(checked_size((size_t)rank,sizeof(int64_t)));tensor->as.tensor.strides=allocate(checked_size((size_t)rank,sizeof(int64_t)));
     int64_t stride=count?1:0; for(int64_t axis=rank;axis-->0;) { tensor->as.tensor.shape[axis]=shape[axis];tensor->as.tensor.strides[axis]=stride;stride=mul_i64(stride,shape[axis]); }
     HValue storage=object_value(H_STORAGE);tensor->as.tensor.storage=storage.as.obj;storage.as.obj->as.storage.dtype=dtype;storage.as.obj->as.storage.count=count;
-    size_t bytes=checked_size((size_t)count,dtype_size(dtype));storage.as.obj->as.storage.data=allocate_storage(bytes);memset(storage.as.obj->as.storage.data,0,bytes);return value;
+    size_t bytes=checked_size((size_t)count,dtype_size(dtype));storage.as.obj->as.storage.data=allocate_storage(bytes);
+    if(zero)memset(storage.as.obj->as.storage.data,0,bytes);
+    return value;
 }
+static HValue tensor_new(int64_t rank,const int64_t *shape,int dtype){return tensor_allocate(rank,shape,dtype,1);}
 static HValue tensor_from_shape(HValue shape,int dtype) {require(shape,H_LIST);int64_t rank=hv_length(shape);int64_t *dimensions=allocate(checked_size((size_t)rank,sizeof(int64_t)));for(int64_t axis=0;axis<rank;axis++)dimensions[axis]=list_int(shape,axis);HValue result=tensor_new(rank,dimensions,dtype);release(dimensions);return result;}
 static int tensor_dtype(HObject *tensor) { return tensor->as.tensor.storage->as.storage.dtype; }
 static int64_t tensor_offset(HObject *tensor,int64_t index) { if(index<0||index>=tensor->as.tensor.count)hv_fail("张量索引越界");int64_t offset=tensor->as.tensor.offset;for(int64_t axis=tensor->as.tensor.rank;axis-->0;) { int64_t size=tensor->as.tensor.shape[axis];offset=add_i64(offset,mul_i64(index%size,tensor->as.tensor.strides[axis]));index/=size; } if(offset<0||offset>=tensor->as.tensor.storage->as.storage.count)hv_fail("张量 view 越界");return offset; }
@@ -287,7 +294,202 @@ static HValue tensor_gather(HObject *source,HValue indices,int64_t axis){axis=ax
 static HValue tensor_scatter(HObject *destination,HValue indices,HObject *source,int64_t axis){axis=axis_value(destination,axis);require(indices,H_LIST);if(destination->as.tensor.rank!=source->as.tensor.rank)hv_fail("scatter_add rank 不匹配");for(int64_t dimension=0;dimension<source->as.tensor.rank;dimension++)if(source->as.tensor.shape[dimension]!=(dimension==axis?hv_length(indices):destination->as.tensor.shape[dimension]))hv_fail("scatter_add shape 不匹配");for(int64_t item=0;item<hv_length(indices);item++){int64_t coordinate=list_int(indices,item);if(coordinate<0||coordinate>=destination->as.tensor.shape[axis])hv_fail("scatter_add 索引越界");}HValue result=tensor_clone(destination);if(!source->as.tensor.count)return result;int64_t inner=1;for(int64_t dimension=source->as.tensor.rank;dimension-->axis+1;)inner=mul_i64(inner,source->as.tensor.shape[dimension]);for(int64_t index=0;index<source->as.tensor.count;index++){int64_t coordinate=coordinate_axis(source,index,axis),outer=index/(source->as.tensor.shape[axis]*inner),tail=index%inner,to=(outer*destination->as.tensor.shape[axis]+list_int(indices,coordinate))*inner+tail;if(tensor_dtype(destination)==D_I64&&tensor_dtype(source)==D_I64){int64_t *data=result.as.obj->as.tensor.storage->as.storage.data;data[to]=add_i64(data[to],((int64_t*)source->as.tensor.storage->as.storage.data)[tensor_offset(source,index)]);}else tensor_write(result.as.obj,to,tensor_read(result.as.obj,to)+tensor_read(source,index));}return result;}
 static HValue tensor_broadcast(HObject *source,HValue target){require(target,H_LIST);int64_t rank=hv_length(target);if(rank<source->as.tensor.rank)hv_fail("broadcast_to rank 不匹配");HValue result=tensor_view(source);HObject *view=result.as.obj;release(view->as.tensor.shape);release(view->as.tensor.strides);view->as.tensor.shape=allocate(checked_size((size_t)rank,sizeof(int64_t)));view->as.tensor.strides=allocate(checked_size((size_t)rank,sizeof(int64_t)));view->as.tensor.rank=rank;for(int64_t axis=0;axis<rank;axis++){int64_t own=axis-(rank-source->as.tensor.rank),size=own<0?1:source->as.tensor.shape[own],desired=list_int(target,axis);if(desired<0||(size!=1&&size!=desired))hv_fail("broadcast_to shape 不兼容");view->as.tensor.shape[axis]=desired;view->as.tensor.strides[axis]=own<0||size==1?0:source->as.tensor.strides[own];}view->as.tensor.count=shape_count(rank,view->as.tensor.shape);return result;}
 static HValue tensor_reduce_shape(HObject *source,HValue target){HValue result=tensor_from_shape(target,tensor_dtype(source)==D_BOOL?D_I64:tensor_dtype(source));HObject *output=result.as.obj;int64_t rank=source->as.tensor.rank;if(output->as.tensor.rank>rank)hv_fail("reduce_to_shape rank 不匹配");for(int64_t axis=0;axis<rank;axis++){int64_t own=axis-(rank-output->as.tensor.rank),size=own<0?1:output->as.tensor.shape[own];if(size!=1&&size!=source->as.tensor.shape[axis])hv_fail("reduce_to_shape shape 不兼容");}for(int64_t index=0;index<source->as.tensor.count;index++){int64_t remainder=index,to=0,stride=1;for(int64_t axis=rank;axis-->0;){int64_t coordinate=remainder%source->as.tensor.shape[axis];remainder/=source->as.tensor.shape[axis];int64_t own=axis-(rank-output->as.tensor.rank);if(own>=0){if(output->as.tensor.shape[own]!=1)to+=coordinate*stride;stride=mul_i64(stride,output->as.tensor.shape[own]?output->as.tensor.shape[own]:1);}}if(tensor_dtype(output)==D_I64){int64_t *data=output->as.tensor.storage->as.storage.data,exact=tensor_dtype(source)==D_I64?((int64_t*)source->as.tensor.storage->as.storage.data)[tensor_offset(source,index)]:(int64_t)tensor_read(source,index);data[to]=add_i64(data[to],exact);}else tensor_write(output,to,tensor_read(output,to)+tensor_read(source,index));}return result;}
-typedef struct MatmulJob { HObject *left,*right,*output; int64_t begin,end,m,n,k,batch_rank; int64_t *batch_shape; int blocked; } MatmulJob;
+#ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
+#endif
+typedef enum MatmulDenseMode { MATMUL_DENSE_OFF, MATMUL_DENSE_COMPENSATED, MATMUL_DENSE_EXACT } MatmulDenseMode;
+typedef struct MatmulJob {
+    HObject *left,*right,*output;
+    int64_t begin,end,m,n,k,batch_rank;
+    int64_t *batch_shape;
+    int blocked;
+    MatmulDenseMode dense_mode;
+} MatmulJob;
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+enum { MATMUL_PANEL_COLUMNS=8, MATMUL_PANEL_MAX_INNER=512 };
+static int matmul_has_fma(void){
+    static int supported=-1;
+    if(supported<0){
+        unsigned int a,b,c,d;
+        unsigned int required=bit_AVX|bit_OSXSAVE|bit_FMA;
+        supported=0;
+        if(__get_cpuid(1,&a,&b,&c,&d)&&(c&required)==required){
+            __asm__("xgetbv":"=a"(a),"=d"(d):"c"(0));
+            supported=(a&6)==6;
+        }
+    }
+    return supported;
+}
+
+__attribute__((target("avx")))
+static int matmul_max_exponent(const double *values,int64_t count,int *exponent){
+    __m256d magnitude=_mm256_setzero_pd(),invalid=_mm256_setzero_pd();
+    __m256d sign=_mm256_set1_pd(-0.0),limit=_mm256_set1_pd(DBL_MAX);
+    int64_t index=0;
+    for(;count-index>=4;index+=4){
+        __m256d absolute=_mm256_andnot_pd(sign,_mm256_loadu_pd(values+index));
+        invalid=_mm256_or_pd(invalid,_mm256_cmp_pd(absolute,limit,_CMP_NLE_UQ));
+        magnitude=_mm256_max_pd(magnitude,absolute);
+    }
+    if(_mm256_movemask_pd(invalid))return 0;
+    double lanes[4];
+    _mm256_storeu_pd(lanes,magnitude);
+    double maximum=fmax(fmax(lanes[0],lanes[1]),fmax(lanes[2],lanes[3]));
+    for(;index<count;index++){
+        if(!isfinite(values[index]))return 0;
+        maximum=fmax(maximum,fabs(values[index]));
+    }
+    frexp(maximum,exponent);
+    return 1;
+}
+
+__attribute__((target("avx")))
+static int matmul_on_binary_grid(const double *values,int64_t count,int power){
+    double scale=ldexp(1.0,power),unscale=ldexp(1.0,-power);
+    __m256d factor=_mm256_set1_pd(scale),inverse=_mm256_set1_pd(unscale);
+    int64_t index=0;
+    for(;count-index>=4;index+=4){
+        __m256d input=_mm256_loadu_pd(values+index);
+        __m256d scaled=_mm256_mul_pd(input,factor);
+        __m256d integral=_mm256_round_pd(scaled,_MM_FROUND_TO_ZERO|_MM_FROUND_NO_EXC);
+        if(_mm256_movemask_pd(_mm256_cmp_pd(input,_mm256_mul_pd(integral,inverse),_CMP_NEQ_UQ)))return 0;
+    }
+    for(;index<count;index++){
+        double scaled=values[index]*scale;
+        if(values[index]!=trunc(scaled)*unscale)return 0;
+    }
+    return 1;
+}
+
+static MatmulDenseMode matmul_dense_mode(MatmulJob *job){
+    HObject *left=job->left,*right=job->right;
+    if(!job->blocked||job->batch_rank||job->m<16||job->n<MATMUL_PANEL_COLUMNS||job->k<16||job->k>MATMUL_PANEL_MAX_INNER||
+       tensor_dtype(left)!=D_F64||tensor_dtype(right)!=D_F64||
+       !tensor_contiguous(left)||!tensor_contiguous(right)||!matmul_has_fma()||
+       (_mm_getcsr()&(_MM_ROUND_MASK|_MM_FLUSH_ZERO_MASK|_MM_DENORMALS_ZERO_MASK)))return MATMUL_DENSE_OFF;
+    const double *first=(const double*)left->as.tensor.storage->as.storage.data+left->as.tensor.offset;
+    const double *second=(const double*)right->as.tensor.storage->as.storage.data+right->as.tensor.offset;
+    int left_exponent,right_exponent;
+    int growth=64-__builtin_clzll((unsigned long long)(job->k-1));
+    if(!matmul_max_exponent(first,left->as.tensor.count,&left_exponent)||
+       !matmul_max_exponent(second,right->as.tensor.count,&right_exponent)||
+       left_exponent+right_exponent+growth>DBL_MAX_EXP-1)return MATMUL_DENSE_OFF;
+    int left_bits=(DBL_MANT_DIG-growth)/2,right_bits=DBL_MANT_DIG-growth-left_bits;
+    if(left_exponent < -450||left_exponent > 450||right_exponent < -450||right_exponent > 450||
+       !matmul_on_binary_grid(first,left->as.tensor.count,left_bits-left_exponent)||
+       !matmul_on_binary_grid(second,right->as.tensor.count,right_bits-right_exponent))return MATMUL_DENSE_COMPENSATED;
+    return MATMUL_DENSE_EXACT;
+}
+
+#define MATMUL_EXACT_ROW(s0,s1,source) do { \
+    __m256d a=_mm256_broadcast_sd(source); \
+    s0=_mm256_fmadd_pd(a,b0,s0);s1=_mm256_fmadd_pd(a,b1,s1); \
+} while(0)
+#define MATMUL_STORE_ROW(s0,s1,destination) do { \
+    _mm256_storeu_pd(destination,s0);_mm256_storeu_pd((destination)+4,s1); \
+} while(0)
+#define MATMUL_LOAD_PANEL(panel_row) \
+    __m256d b0=_mm256_load_pd(panel_row),b1=_mm256_load_pd((panel_row)+4)
+__attribute__((target("avx,fma")))
+static void matmul_exact_panel(const double *left,const double *panel,double *output,int64_t rows,int64_t inner,int64_t columns){
+    int64_t row=0;
+    for(;rows-row>=6;row+=6){
+        __m256d sum00=_mm256_setzero_pd(),sum01=sum00,sum10=sum00,sum11=sum00;
+        __m256d sum20=sum00,sum21=sum00,sum30=sum00,sum31=sum00;
+        __m256d sum40=sum00,sum41=sum00,sum50=sum00,sum51=sum00;
+        const double *first=left+row*inner;
+        for(int64_t index=0;index<inner;index++){
+            MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
+            MATMUL_EXACT_ROW(sum00,sum01,first+index);
+            MATMUL_EXACT_ROW(sum10,sum11,first+inner+index);
+            MATMUL_EXACT_ROW(sum20,sum21,first+2*inner+index);
+            MATMUL_EXACT_ROW(sum30,sum31,first+3*inner+index);
+            MATMUL_EXACT_ROW(sum40,sum41,first+4*inner+index);
+            MATMUL_EXACT_ROW(sum50,sum51,first+5*inner+index);
+        }
+        double *target=output+row*columns;
+        MATMUL_STORE_ROW(sum00,sum01,target);
+        MATMUL_STORE_ROW(sum10,sum11,target+columns);
+        MATMUL_STORE_ROW(sum20,sum21,target+2*columns);
+        MATMUL_STORE_ROW(sum30,sum31,target+3*columns);
+        MATMUL_STORE_ROW(sum40,sum41,target+4*columns);
+        MATMUL_STORE_ROW(sum50,sum51,target+5*columns);
+    }
+    for(;row<rows;row++){
+        __m256d sum0=_mm256_setzero_pd(),sum1=sum0;
+        for(int64_t index=0;index<inner;index++){
+            MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
+            MATMUL_EXACT_ROW(sum0,sum1,left+row*inner+index);
+        }
+        MATMUL_STORE_ROW(sum0,sum1,output+row*columns);
+    }
+}
+#undef MATMUL_EXACT_ROW
+
+#define MATMUL_COMPENSATE(total,correction,value) do { \
+    __m256d adjusted=_mm256_sub_pd(value,correction); \
+    __m256d next=_mm256_add_pd(total,adjusted); \
+    correction=_mm256_sub_pd(_mm256_sub_pd(next,total),adjusted); \
+    total=next; \
+} while(0)
+__attribute__((target("avx")))
+static void matmul_compensated_panel(const double *left,const double *panel,double *output,int64_t rows,int64_t inner,int64_t columns){
+    int64_t row=0;
+    for(;rows-row>=2;row+=2){
+        __m256d sum00=_mm256_setzero_pd(),sum01=sum00,sum10=sum00,sum11=sum00;
+        __m256d correction00=sum00,correction01=sum00,correction10=sum00,correction11=sum00;
+        const double *first=left+row*inner;
+        for(int64_t index=0;index<inner;index++){
+            MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
+            __m256d a0=_mm256_broadcast_sd(first+index),a1=_mm256_broadcast_sd(first+inner+index);
+            MATMUL_COMPENSATE(sum00,correction00,_mm256_mul_pd(a0,b0));
+            MATMUL_COMPENSATE(sum01,correction01,_mm256_mul_pd(a0,b1));
+            MATMUL_COMPENSATE(sum10,correction10,_mm256_mul_pd(a1,b0));
+            MATMUL_COMPENSATE(sum11,correction11,_mm256_mul_pd(a1,b1));
+        }
+        MATMUL_STORE_ROW(sum00,sum01,output+row*columns);
+        MATMUL_STORE_ROW(sum10,sum11,output+(row+1)*columns);
+    }
+    if(row<rows){
+        __m256d sum0=_mm256_setzero_pd(),sum1=sum0,correction0=sum0,correction1=sum0;
+        for(int64_t index=0;index<inner;index++){
+            MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
+            __m256d a=_mm256_broadcast_sd(left+row*inner+index);
+            MATMUL_COMPENSATE(sum0,correction0,_mm256_mul_pd(a,b0));
+            MATMUL_COMPENSATE(sum1,correction1,_mm256_mul_pd(a,b1));
+        }
+        MATMUL_STORE_ROW(sum0,sum1,output+row*columns);
+    }
+}
+#undef MATMUL_COMPENSATE
+#undef MATMUL_LOAD_PANEL
+#undef MATMUL_STORE_ROW
+
+static void matmul_dense_f64(MatmulJob *job){
+    int64_t inner=job->k,columns=job->n,rows=job->end-job->begin;
+    const double *left=(const double*)job->left->as.tensor.storage->as.storage.data+job->left->as.tensor.offset+job->begin*inner;
+    const double *right=(const double*)job->right->as.tensor.storage->as.storage.data+job->right->as.tensor.offset;
+    double *output=(double*)job->output->as.tensor.storage->as.storage.data+job->begin*columns;
+    _Alignas(64) double panel[MATMUL_PANEL_MAX_INNER*MATMUL_PANEL_COLUMNS];
+    int64_t column=0;
+    for(;columns-column>=MATMUL_PANEL_COLUMNS;column+=MATMUL_PANEL_COLUMNS){
+        for(int64_t index=0;index<inner;index++)
+            memcpy(panel+index*MATMUL_PANEL_COLUMNS,right+index*columns+column,MATMUL_PANEL_COLUMNS*sizeof(double));
+        if(job->dense_mode==MATMUL_DENSE_EXACT)matmul_exact_panel(left,panel,output+column,rows,inner,columns);
+        else matmul_compensated_panel(left,panel,output+column,rows,inner,columns);
+    }
+    for(int64_t row=0;row<rows;row++)for(int64_t tail=column;tail<columns;tail++){
+        double total=0,correction=0;
+        for(int64_t index=0;index<inner;index++){
+            double adjusted=left[row*inner+index]*right[index*columns+tail]-correction;
+            double next=total+adjusted;
+            correction=(next-total)-adjusted;
+            total=next;
+        }
+        output[row*columns+tail]=total;
+    }
+}
+#endif
 #define MATMUL_FLOAT_COLUMNS(right_index) do { \
     for(int64_t column=0;column<width;column++){ \
         double b=second[right_index],value=a*b,adjusted=value-corrections[column],next=totals[column]+adjusted; \
@@ -324,14 +526,26 @@ static int matmul_float_row(MatmulJob *job,int64_t row,int64_t lo,int64_t ro){
 static void matmul_run(MatmulJob *job){HObject *left=job->left,*right=job->right,*output=job->output;int64_t lr=left->as.tensor.rank,rr=right->as.tensor.rank;for(int64_t row=job->begin;row<job->end;row++){int64_t batch=row/job->m,m=row%job->m,remainder=batch,lo=left->as.tensor.offset,ro=right->as.tensor.offset;for(int64_t axis=job->batch_rank;axis-->0;){int64_t coordinate=remainder%job->batch_shape[axis];remainder/=job->batch_shape[axis];int64_t la=axis-(job->batch_rank-(lr-2)),ra=axis-(job->batch_rank-(rr-2));if(la>=0&&left->as.tensor.shape[la]!=1)lo+=coordinate*left->as.tensor.strides[la];if(ra>=0&&right->as.tensor.shape[ra]!=1)ro+=coordinate*right->as.tensor.strides[ra];}lo+=m*left->as.tensor.strides[lr-2];if(matmul_float_row(job,row,lo,ro))continue;for(int64_t block=0;block<job->n;block+=job->blocked?32:job->n){int64_t end=job->blocked&&job->n-block>32?block+32:job->n;double totals[32],corrections[32];if(job->blocked){memset(totals,0,sizeof(totals));memset(corrections,0,sizeof(corrections));}for(int64_t column=block;column<end;column++){int64_t target=row*job->n+column;if(tensor_dtype(output)==D_I64){int64_t total=0;for(int64_t k=0;k<job->k;k++){int64_t a=tensor_dtype(left)==D_I64?((int64_t*)left->as.tensor.storage->as.storage.data)[lo+k*left->as.tensor.strides[lr-1]]:(int64_t)read_offset(left,lo+k*left->as.tensor.strides[lr-1]);int64_t b=tensor_dtype(right)==D_I64?((int64_t*)right->as.tensor.storage->as.storage.data)[ro+k*right->as.tensor.strides[rr-2]+column*right->as.tensor.strides[rr-1]]:(int64_t)read_offset(right,ro+k*right->as.tensor.strides[rr-2]+column*right->as.tensor.strides[rr-1]);total=add_i64(total,mul_i64(a,b));}((int64_t*)output->as.tensor.storage->as.storage.data)[target]=total;}else if(!job->blocked){double total=0,correction=0;for(int64_t k=0;k<job->k;k++){double value=read_offset(left,lo+k*left->as.tensor.strides[lr-1])*read_offset(right,ro+k*right->as.tensor.strides[rr-2]+column*right->as.tensor.strides[rr-1]);double adjusted=value-correction,next=total+adjusted;correction=isfinite(next)?(next-total)-adjusted:0;total=next;}tensor_write(output,target,total);}}
             if(job->blocked&&tensor_dtype(output)!=D_I64){for(int64_t kblock=0;kblock<job->k;kblock+=32){int64_t kend=job->k-kblock>32?kblock+32:job->k;for(int64_t k=kblock;k<kend;k++){double a=read_offset(left,lo+k*left->as.tensor.strides[lr-1]);for(int64_t column=block;column<end;column++){int64_t local=column-block;double value=a*read_offset(right,ro+k*right->as.tensor.strides[rr-2]+column*right->as.tensor.strides[rr-1]),adjusted=value-corrections[local],next=totals[local]+adjusted;corrections[local]=isfinite(next)?(next-totals[local])-adjusted:0;totals[local]=next;}}}for(int64_t column=block;column<end;column++)tensor_write(output,row*job->n+column,totals[column-block]);}
         }} }
-#ifdef _WIN32
-static DWORD WINAPI matmul_thread(LPVOID argument){matmul_run((MatmulJob*)argument);return 0;}
+static void matmul_rows(MatmulJob *job){
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    if(job->dense_mode){matmul_dense_f64(job);return;}
 #endif
-static HValue tensor_matmul(HObject *left,HObject *right){int64_t lr=left->as.tensor.rank,rr=right->as.tensor.rank;if(lr<2||rr<2)hv_fail("matmul 需要至少二维张量");int64_t m=left->as.tensor.shape[lr-2],k=left->as.tensor.shape[lr-1],n=right->as.tensor.shape[rr-1];if(k!=right->as.tensor.shape[rr-2])hv_fail("matmul 内维度不匹配");int64_t rank=lr>rr?lr:rr;int64_t *shape=allocate(checked_size((size_t)rank,sizeof(int64_t)));for(int64_t axis=0;axis<rank-2;axis++){int64_t la=axis-(rank-lr),ra=axis-(rank-rr),a=la<0?1:left->as.tensor.shape[la],b=ra<0?1:right->as.tensor.shape[ra];if(a!=b&&a!=1&&b!=1)hv_fail("matmul 批维度不兼容");shape[axis]=a==1?b:a;}shape[rank-2]=m;shape[rank-1]=n;int dtype=promoted(tensor_dtype(left),tensor_dtype(right));if(dtype==D_BOOL)dtype=D_I64;HValue result=tensor_new(rank,shape,dtype);release(shape);if(!result.as.obj->as.tensor.count)return result;int64_t rows=result.as.obj->as.tensor.count/n;MatmulJob job={0};job.left=left;job.right=right;job.output=result.as.obj;job.end=rows;job.m=m;job.n=n;job.k=k;job.batch_rank=rank-2;job.blocked=optimized;job.batch_shape=result.as.obj->as.tensor.shape;
+    matmul_run(job);
+}
+#ifdef _WIN32
+static DWORD WINAPI matmul_thread(LPVOID argument){matmul_rows((MatmulJob*)argument);return 0;}
+#endif
+static HValue tensor_matmul(HObject *left,HObject *right){int64_t lr=left->as.tensor.rank,rr=right->as.tensor.rank;if(lr<2||rr<2)hv_fail("matmul 需要至少二维张量");int64_t m=left->as.tensor.shape[lr-2],k=left->as.tensor.shape[lr-1],n=right->as.tensor.shape[rr-1];if(k!=right->as.tensor.shape[rr-2])hv_fail("matmul 内维度不匹配");int64_t rank=lr>rr?lr:rr;int64_t *shape=allocate(checked_size((size_t)rank,sizeof(int64_t)));for(int64_t axis=0;axis<rank-2;axis++){int64_t la=axis-(rank-lr),ra=axis-(rank-rr),a=la<0?1:left->as.tensor.shape[la],b=ra<0?1:right->as.tensor.shape[ra];if(a!=b&&a!=1&&b!=1)hv_fail("matmul 批维度不兼容");shape[axis]=a==1?b:a;}shape[rank-2]=m;shape[rank-1]=n;int dtype=promoted(tensor_dtype(left),tensor_dtype(right));if(dtype==D_BOOL)dtype=D_I64;HValue result=tensor_allocate(rank,shape,dtype,0);release(shape);if(!result.as.obj->as.tensor.count)return result;int64_t rows=result.as.obj->as.tensor.count/n;MatmulJob job={0};job.left=left;job.right=right;job.output=result.as.obj;job.end=rows;job.m=m;job.n=n;job.k=k;job.batch_rank=rank-2;job.blocked=optimized;job.batch_shape=result.as.obj->as.tensor.shape;
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    job.dense_mode=matmul_dense_mode(&job);
+#endif
 #ifdef _WIN32
     int workers=thread_count;if(workers>rows)workers=(int)rows;if(workers>1){HANDLE *handles=allocate((size_t)workers*sizeof(HANDLE));MatmulJob *jobs=allocate((size_t)workers*sizeof(MatmulJob));for(int index=0;index<workers;index++){jobs[index]=job;jobs[index].begin=(rows/workers)*index+(rows%workers)*index/workers;jobs[index].end=(rows/workers)*(index+1)+(rows%workers)*(index+1)/workers;handles[index]=CreateThread(NULL,0,matmul_thread,&jobs[index],0,NULL);if(!handles[index])hv_fail("创建计算线程失败");}for(int index=0;index<workers;index++){if(WaitForSingleObject(handles[index],INFINITE)!=WAIT_OBJECT_0)hv_fail("等待计算线程失败");CloseHandle(handles[index]);}release(handles);release(jobs);return result;}
 #endif
-    matmul_run(&job);return result;}
+    matmul_rows(&job);return result;}
+#ifdef __clang__
+#pragma STDC FP_CONTRACT DEFAULT
+#endif
 static HValue tensor_softmax(HObject *source,int64_t axis){axis=axis_value(source,axis);int dtype=tensor_dtype(source)==D_F32?D_F32:D_F64;HValue result=tensor_new(source->as.tensor.rank,source->as.tensor.shape,dtype);if(!source->as.tensor.count)return result;int64_t width=source->as.tensor.shape[axis],inner=1,outer=1;for(int64_t dimension=0;dimension<axis;dimension++)outer=mul_i64(outer,source->as.tensor.shape[dimension]);for(int64_t dimension=axis+1;dimension<source->as.tensor.rank;dimension++)inner=mul_i64(inner,source->as.tensor.shape[dimension]);if(!width)return result;for(int64_t group=0;group<outer;group++)for(int64_t tail=0;tail<inner;tail++){double maximum=-INFINITY,total=0;int64_t positive=0;for(int64_t item=0;item<width;item++){double value=tensor_read(source,(group*width+item)*inner+tail);if(isnan(value))hv_fail("softmax 输入含 NaN");if(value>maximum)maximum=value;if(value==INFINITY)positive++;}for(int64_t item=0;item<width;item++){int64_t index=(group*width+item)*inner+tail;double value=tensor_read(source,index);double weight=positive?(value==INFINITY?1.0:0.0):maximum==-INFINITY?1.0:exp(value-maximum);tensor_write(result.as.obj,index,weight);total+=weight;}for(int64_t item=0;item<width;item++){int64_t index=(group*width+item)*inner+tail;tensor_write(result.as.obj,index,tensor_read(result.as.obj,index)/total);}}return result;}
 static void convolution_shape(const int64_t *shape,int64_t kh,int64_t kw,int64_t stride,int64_t padding,int64_t *oh,int64_t *ow){if(kh<=0||kw<=0||stride<=0||padding<0)hv_fail("卷积窗口参数无效");int64_t height=sub_i64(add_i64(shape[2],mul_i64(2,padding)),kh),width=sub_i64(add_i64(shape[3],mul_i64(2,padding)),kw);*oh=height<0?0:add_i64(height/stride,1);*ow=width<0?0:add_i64(width/stride,1);}
 static HValue tensor_unfold(HObject *source,int64_t kh,int64_t kw,int64_t stride,int64_t padding){if(source->as.tensor.rank!=4)hv_fail("unfold2d 需要 NCHW 张量");int64_t oh,ow;convolution_shape(source->as.tensor.shape,kh,kw,stride,padding,&oh,&ow);int64_t shape[3]={source->as.tensor.shape[0],mul_i64(source->as.tensor.shape[1],mul_i64(kh,kw)),mul_i64(oh,ow)};HValue result=tensor_new(3,shape,tensor_dtype(source));int64_t channels=source->as.tensor.shape[1],height=source->as.tensor.shape[2],width=source->as.tensor.shape[3];for(int64_t index=0;index<result.as.obj->as.tensor.count;index++){int64_t location=index%shape[2],channel=(index/shape[2])%shape[1],batch=index/(shape[2]*shape[1]),c=channel/(kh*kw),y=(location/ow)*stride-padding+(channel/kw)%kh,x=(location%ow)*stride-padding+channel%kw;if(y>=0&&y<height&&x>=0&&x<width)copy_element(result.as.obj,index,source,((batch*channels+c)*height+y)*width+x);}return result;}

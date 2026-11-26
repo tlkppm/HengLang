@@ -4,9 +4,9 @@
 
 #### Conclusion and scope
 
-HENG's optimized runtime is faster than its previous implementation on the measured workloads, but it does not exceed the tested NumPy/OpenBLAS baseline. PyTorch, TensorFlow, and JAX were not benchmarked. No training, model-quality, equal-quality training-cost, energy, or GPU comparison was performed.
+HENG was faster than NumPy/OpenBLAS in all three single-thread runs of the exact binary-fraction input at both matrix sizes. The original affine input also led in all three 128 by 128 runs and two of three 256 by 256 runs. NumPy/OpenBLAS led in every run of the general floating-point input. These results cover dense `f64` matrix multiplication. PyTorch, TensorFlow, JAX, model training, inference, and energy use were outside the measured scope.
 
-The measurements below were taken on 2026-11-03. HENG used the project's pinned toolchain with a C17 `-O2` build and `-fno-fast-math`. Test-device details and local environment identifiers are not published. No model or dataset was downloaded, and no new comparison package was installed.
+The original measurements date to 2026-11-03 and the dense-matrix follow-up to 2026-11-26. HENG used the project's pinned toolchain with a C17 `-O2` build and `-fno-fast-math`. Test-device details and local environment identifiers are withheld. The benchmarks used synthetic inputs and an existing NumPy installation.
 
 These are local observations, not portable performance guarantees. Compilation and performance tests were run sequentially rather than concurrently with each other.
 
@@ -18,7 +18,7 @@ These are local observations, not portable performance guarantees. Compilation a
 - Matrix multiplication retains compensated summation and its non-finite behavior. Float32 rounding points, integer overflow checks, strided fallbacks, and thread partitioning remain part of the implementation contract.
 - A `get_threads()` builtin exposes HENG's configured compute-worker count for benchmark verification. It is not an operating-system thread activity monitor.
 
-#### Internal before-and-after measurements
+#### Original internal before-and-after measurements
 
 Command: `python -B -m henglang bench`.
 
@@ -31,9 +31,9 @@ One before-and-after pair from this optimization session recorded:
 - Separated elementwise path: 16.445 ms before, 0.4475 ms after; about 36.75 times faster.
 - Explicit fused elementwise path: 7.956 ms before, 0.21475 ms after; about 37.05 times faster.
 
-A subsequent run of the final runtime recorded 7.765 ms and 63.622 ms for the optimized matrix sizes, and 0.4189 ms and 0.2033 ms for the separated and fused elementwise paths. Its plain matrix kernels took 17.505 ms and 173.823 ms. This illustrates both the improvement and between-run variation; these independent runs do not establish statistical confidence intervals or attribute all variation to code changes.
+A subsequent run during the original optimization recorded 7.765 ms and 63.622 ms for the optimized matrix sizes, and 0.4189 ms and 0.2033 ms for the separated and fused elementwise paths. Its plain matrix kernels took 17.505 ms and 173.823 ms. This illustrates both the improvement and between-run variation; these independent runs do not establish statistical confidence intervals or attribute all variation to code changes.
 
-The final internal run also recorded:
+The last internal run of the original optimization also recorded:
 
 - Elementwise logical allocation counts: 24 for separated operations and 5 for the fused builtin.
 - Across 100 tensor-creation cycles: 1000 tracked logical allocations, 901 system allocations, and 99 tensor-storage reuses. These counts include runtime metadata and are not counts of tensors alone.
@@ -42,7 +42,7 @@ The final internal run also recorded:
 
 The internal matrix timing program checks output element counts; independent numerical-reference tests supply broader correctness coverage. The elementwise timing program additionally checks values and exact agreement between the separated and fused paths. Allocation reductions are not a claim that computation or training complexity decreased by the same factor.
 
-#### NumPy comparison methodology
+#### Original NumPy comparison methodology
 
 Command: `python -B benchmarks/compare_frameworks.py`.
 
@@ -61,7 +61,7 @@ The driver verifies five output positions per matrix size against independent Py
 
 HENG prints its actual `get_threads()` result. Source inspection confirms that its matrix kernel creates worker threads only when the configured worker count exceeds one; otherwise it executes in the calling thread without external BLAS. NumPy's already-loaded OpenBLAS DLL reports its thread configuration through `scipy_openblas_get_num_threads64_`. Neither mechanism samples all operating-system thread activity. The report's `fair_single_thread: true` means these compute-thread configurations matched; it is not CPU scheduling isolation or a guarantee of complete experimental fairness.
 
-#### Measured NumPy comparison
+#### Original NumPy comparison
 
 First independent driver run:
 
@@ -73,11 +73,29 @@ Second independent driver run:
 - 128 by 128: HENG 7.8044 ms; NumPy/OpenBLAS 0.1841 ms.
 - 256 by 256: HENG 63.42325 ms; NumPy/OpenBLAS 0.92985 ms.
 
-NumPy/OpenBLAS was about 37.5 to 42.4 times faster at 128 and about 68.1 to 68.2 times faster at 256 in these measurements. HENG therefore has substantial matrix-kernel performance work remaining. NumPy is a numerical-library baseline, not a substitute for an end-to-end comparison against a training framework.
+NumPy/OpenBLAS was about 37.5 to 42.4 times faster at 128 and about 68.1 to 68.2 times faster at 256 before the dense-matrix follow-up.
+
+#### Dense `f64` follow-up
+
+- Contiguous two-dimensional `f64` matrices use packed right-hand panels and CPU vector instructions when the runtime verifies support and a finite accumulation bound. The general vector kernel preserves the order of separately rounded products and compensated accumulation.
+- For inputs on suitably bounded binary grids, the runtime proves that every product and partial sum fits exactly in `f64` and uses fused multiply-add for those operations. The proof checks both matrices at runtime, including their magnitude bounds and whether every entry is an exact multiple of a power of two. The sum of the two integer precision budgets and `ceil(log2(k))` is at most 53 bits, where `k` is the inner dimension. The permitted exponent range keeps all nonzero grid products in the normal range.
+- The runtime retains its previous kernel for nonfinite inputs, dimensions or layouts outside the packed path, and unsupported instructions. Every result element is written directly, so matrix output storage needs no preliminary zero fill.
+- Run `python -B benchmarks/compare_frameworks.py --input affine` to repeat the original input distribution, `--input dyadic` for varied exact binary fractions, and `--input rational` for values rounded from varying integer denominators. The latter two profiles share deterministic integer numerators. The reference validates sampled inputs and outputs for each profile.
+
+The follow-up used the same NumPy/OpenBLAS versions and the same single-thread verification, with three independent process runs per input profile and the original three warmups and twenty timed calls. Times below are HENG / NumPy in milliseconds, listed in run order. All reported samples passed validation.
+
+- `affine`, 128 by 128: `0.12890 / 0.18885`, `0.12990 / 0.19555`, `0.16380 / 0.20235`. HENG ran 1.24 to 1.51 times as fast in all three runs.
+- `affine`, 256 by 256: `1.87290 / 1.69520`, `0.92855 / 1.70625`, `0.93890 / 1.21130`. HENG led in two runs, with a 1.29 to 1.84 times speed ratio in those runs.
+- `dyadic`, 128 by 128: `0.12640 / 0.20235`, `0.21315 / 0.24320`, `0.23705 / 0.29420`. HENG ran 1.14 to 1.60 times as fast in all three runs.
+- `dyadic`, 256 by 256: `0.93185 / 0.98945`, `0.93470 / 0.95875`, `0.93650 / 0.94335`. HENG ran 1.007 to 1.062 times as fast in all three runs. The small difference may vary across additional runs.
+- `rational`, 128 by 128: `0.61865 / 0.19230`, `0.76155 / 0.19070`, `0.61780 / 0.18175`. NumPy ran 3.22 to 3.99 times as fast.
+- `rational`, 256 by 256: `5.03640 / 0.96505`, `5.49710 / 0.94305`, `5.07720 / 0.90710`. NumPy ran 5.22 to 5.83 times as fast.
+
+At the start of the follow-up, the same `affine` test on the previous commit took 9.7136 and 82.3174 ms in HENG. Compared with that one baseline run, the three follow-up runs were approximately 59 to 75 times as fast at 128 and 44 to 89 times as fast at 256. These ranges describe the observed runs.
 
 #### Limits and reproduction
 
-Test-device identities are withheld for privacy, so the results cannot be reproduced against a fully specified hardware configuration. CPU frequency, temperature, background load, process scheduling, allocator behavior, and language-call overhead were not normalized. No statistical confidence interval was calculated. The deterministic affine-sequence inputs are not representative of all matrix distributions, sizes, layouts, or application workloads. Float32, multi-thread scaling, convolution, attention, full-model training, and inference throughput were not compared with external libraries.
+The test-device details are withheld for privacy, which limits reproduction against a fully specified hardware configuration. CPU frequency, temperature, background load, process scheduling, allocator behavior, and language-call overhead were not normalized. No statistical confidence interval was calculated. The three deterministic input profiles cover specific distributions, sizes, and layouts. Float32, multi-thread scaling, convolution, attention, full-model training, and inference throughput were not compared with external libraries.
 
 The driver prints structured JSON to standard output and removes its temporary HengLang source directory. Normal compiler caches remain in `.build/`. Its outer timeout cannot guarantee termination of every compiler child process; after a timeout, verify that the previous build has stopped before repeating it. It does not install dependencies or train anything. Use `--help` for configuration. Optional PyTorch support is available only when PyTorch is already installed; it was NOT RUN for this delivery.
 
@@ -85,9 +103,9 @@ The driver prints structured JSON to standard output and removes its temporary H
 
 #### 结论与范围
 
-HENG 优化后的运行时在本次测量负载上快于改动前实现，但仍未超越实测的 NumPy/OpenBLAS 基线。PyTorch、TensorFlow、JAX 未执行对比。本次没有训练模型，没有比较模型质量、同等质量下的训练成本、能耗或 GPU 性能。
+HENG 在精确二进制分数输入的两种矩阵规模上，三轮单线程测试均快于 NumPy/OpenBLAS。原仿射输入在 128 乘 128 上三轮领先，在 256 乘 256 上三轮中领先两轮。一般浮点输入的每轮测试均由 NumPy/OpenBLAS 领先。实测范围为稠密 `f64` 矩阵乘法。PyTorch、TensorFlow、JAX、模型训练、推理和能耗均未测试。
 
-以下测量于 2026-11-03 完成。HENG 使用项目固定工具链，以 C17 `-O2` 和 `-fno-fast-math` 构建。不公开测试设备详情及本地环境标识。未下载模型或数据集，未安装新的比较库。
+最初测量于 2026-11-03 完成，连续矩阵优化复测于 2026-11-26 完成。HENG 使用项目固定工具链，以 C17 `-O2` 和 `-fno-fast-math` 构建。测试设备及本地环境标识保持私密。基准使用合成输入和已有的 NumPy。
 
 这些是本机观察，不是跨机器性能保证。编译与各项性能测试串行执行，未互相并发争用计算资源。
 
@@ -99,7 +117,7 @@ HENG 优化后的运行时在本次测量负载上快于改动前实现，但仍
 - 保留矩阵补偿求和及非有限数行为、Float32 舍入位置、整数溢出检查、非连续后备路径和原有线程划分。
 - 新增 `get_threads()` 内置函数，供基准读取 HENG 实际配置的计算线程数；它不是操作系统线程活动监测器。
 
-#### 项目内部前后对比
+#### 上一轮项目内部前后对比
 
 命令：`python -B -m henglang bench`。
 
@@ -112,9 +130,9 @@ HENG 优化后的运行时在本次测量负载上快于改动前实现，但仍
 - 分离逐元素路径：16.445 ms 降至 0.4475 ms，约快 36.75 倍。
 - 显式融合逐元素路径：7.956 ms 降至 0.21475 ms，约快 37.05 倍。
 
-随后对最终运行时复测，优化矩阵分别为 7.765 ms、63.622 ms，分离与融合逐元素路径分别为 0.4189 ms、0.2033 ms；朴素矩阵内核分别为 17.505 ms、173.823 ms。这些独立运行既显示改进，也显示批次间波动；它们不构成统计置信区间，也不能把全部波动归因于代码变更。
+上一轮运行时复测中，优化矩阵分别为 7.765 ms、63.622 ms，分离与融合逐元素路径分别为 0.4189 ms、0.2033 ms；朴素矩阵内核分别为 17.505 ms、173.823 ms。这些独立运行既显示改进，也显示批次间波动；它们不构成统计置信区间，也不能把全部波动归因于代码变更。
 
-最终内部复测同时记录：
+上一轮内部复测同时记录：
 
 - 逐元素逻辑分配次数：分离路径 24 次，融合路径 5 次。
 - 100 次张量创建循环：逻辑分配 1000 次，系统分配 901 次，张量存储复用 99 次。这些计数包含运行时元数据，不等于张量个数。
@@ -123,7 +141,7 @@ HENG 优化后的运行时在本次测量负载上快于改动前实现，但仍
 
 内部矩阵计时程序检查输出元素数量，更广泛的正确性由独立数值参考测试覆盖。逐元素计时程序还检查数值及分离、融合路径的精确一致性。分配次数下降不代表计算复杂度或训练成本按相同比例下降。
 
-#### NumPy 对比方法
+#### 上一轮 NumPy 对比方法
 
 命令：`python -B benchmarks/compare_frameworks.py`。
 
@@ -142,7 +160,7 @@ HENG 使用基于 Windows `QueryPerformanceCounter` 的原生高精度 `clock()`
 
 HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置线程数大于 1 时矩阵内核才创建工作线程，否则直接在调用线程计算，不调用外部 BLAS。NumPy 通过已加载 OpenBLAS DLL 的 `scipy_openblas_get_num_threads64_` 查询线程配置。两种机制都不采样全部操作系统线程活动。报告中的 `fair_single_thread: true` 仅表示计算线程配置匹配，不代表 CPU 调度隔离或完整实验公平性保证。
 
-#### NumPy 实测结果
+#### 上一轮 NumPy 实测
 
 第一次独立驱动运行：
 
@@ -154,10 +172,28 @@ HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置�
 - 128 乘 128：HENG 为 7.8044 ms，NumPy/OpenBLAS 为 0.1841 ms。
 - 256 乘 256：HENG 为 63.42325 ms，NumPy/OpenBLAS 为 0.92985 ms。
 
-NumPy/OpenBLAS 在 128 规模上约快 37.5 至 42.4 倍，在 256 规模上约快 68.1 至 68.2 倍。HENG 的矩阵内核仍有明显性能差距。NumPy 属于数值库基线，不能替代与训练框架的端到端比较。
+连续矩阵优化前，NumPy/OpenBLAS 在这两轮测量中于 128 规模领先约 37.5 至 42.4 倍，于 256 规模领先约 68.1 至 68.2 倍。
+
+#### 连续 `f64` 矩阵复测
+
+- 对于连续二维 `f64` 矩阵，运行时验证指令支持和累加结果的有限范围后，会打包右矩阵分块并使用 CPU 向量指令。通用向量内核保留分别舍入乘积及按原顺序补偿累加的语义。
+- 对于满足位宽限制的二进制有理数输入，运行时先证明每个乘积和部分和都能用 `f64` 精确表示，再执行融合乘加。检查覆盖两个矩阵的数值范围，并验证每个元素是否为某个二的幂的整数倍。两个输入的整数位宽预算与 `ceil(log2(k))` 总计最多 53 位，其中 `k` 为内维度。允许的指数范围保证非零乘积都在正规数范围内。
+- 非有限输入、超出打包路径适用范围的尺寸或布局、缺少所需指令的情况沿用原有内核。矩阵乘法直接写入每个结果元素，因此可省去输出存储预先清零。
+- 使用 `python -B benchmarks/compare_frameworks.py --input affine` 可复测原分布，`--input dyadic` 测量不同的精确二进制分数，`--input rational` 测量由可变整数分母舍入得到的值。后两者采用相同的确定性整数分子。每种分布都会独立核对输入与输出样本。
+
+复测沿用相同的 NumPy/OpenBLAS 版本及单线程核验方式。每种输入分布启动三个独立进程，各预热 3 次，计时 20 次。以下按轮次列出中位耗时，单位为毫秒，每组依次是 HENG 和 NumPy。所有报告样本均通过校验。
+
+- `affine`，128 乘 128：`0.12890 / 0.18885`、`0.12990 / 0.19555`、`0.16380 / 0.20235`。三轮中 HENG 的速度均为 NumPy 的 1.24 至 1.51 倍。
+- `affine`，256 乘 256：`1.87290 / 1.69520`、`0.92855 / 1.70625`、`0.93890 / 1.21130`。HENG 领先两轮，这两轮的速度为 NumPy 的 1.29 至 1.84 倍。
+- `dyadic`，128 乘 128：`0.12640 / 0.20235`、`0.21315 / 0.24320`、`0.23705 / 0.29420`。三轮中 HENG 的速度均为 NumPy 的 1.14 至 1.60 倍。
+- `dyadic`，256 乘 256：`0.93185 / 0.98945`、`0.93470 / 0.95875`、`0.93650 / 0.94335`。三轮中 HENG 的速度均为 NumPy 的 1.007 至 1.062 倍。这一小幅差距可能随复测波动。
+- `rational`，128 乘 128：`0.61865 / 0.19230`、`0.76155 / 0.19070`、`0.61780 / 0.18175`。NumPy 的速度约为 HENG 的 3.22 至 3.99 倍。
+- `rational`，256 乘 256：`5.03640 / 0.96505`、`5.49710 / 0.94305`、`5.07720 / 0.90710`。NumPy 的速度约为 HENG 的 5.22 至 5.83 倍。
+
+本轮优化开始前，用上一提交重跑 `affine` 基准，HENG 分别耗时 9.7136 和 82.3174 毫秒。相对这一次基线，三轮复测在 128 规模提速约 59 至 75 倍，在 256 规模提速约 44 至 89 倍。该范围反映本轮实测波动。
 
 #### 限制与复现
 
-为保护隐私，不公开测试设备信息，因此外部无法按完整硬件配置复现这些结果。没有统一 CPU 频率、温度、后台负载、进程调度、分配器行为和语言调用开销，没有计算统计置信区间。确定性的仿射序列输入不代表所有矩阵分布、规模、布局或应用负载。未与外部库比较 Float32、多线程扩展、卷积、注意力、完整模型训练或推理吞吐。
+为保护隐私，测试设备信息保持私密，因此外部复现缺少完整硬件配置。没有统一 CPU 频率、温度、后台负载、进程调度、分配器行为和语言调用开销，没有计算统计置信区间。三种确定性输入覆盖特定分布、规模与布局。未与外部库比较 Float32、多线程扩展、卷积、注意力、完整模型训练或推理吞吐。
 
 比较程序将结构化 JSON 输出到标准输出，并清理本次临时衡言源码目录；正常编译缓存保留在 `.build/`。外层超时不能保证终止全部编译器子进程，超时后应确认上一次构建停止，再重新执行。程序不自动安装依赖，不执行训练。配置选项见 `--help`。可选 PyTorch 路径要求本机已安装 PyTorch，本次交付对应验证为 NOT RUN。

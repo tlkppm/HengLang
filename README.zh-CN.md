@@ -71,7 +71,7 @@ python -B benchmarks/compare_frameworks.py --help
 python -B benchmarks/compare_frameworks.py
 ```
 
-比较程序使用本机已经安装且受支持的比较库，不自动安装依赖。报告计时前会验证数值样本。对比结果属于算子级测量，不构成整个框架的综合排名。本机已记录的实测中，NumPy 配合 OpenBLAS 在两种矩阵规模上均快于 HENG；HENG 在这些测试中尚未超越该基线。
+比较程序使用已有的比较库，并校验输入和输出样本。在已核验单线程配置的三轮测试中，HENG 对两种规模的精确二进制分数 `f64` 矩阵均领先 NumPy/OpenBLAS。一般浮点输入仍由 NumPy/OpenBLAS 领先，较大规模的原始仿射输入则有输有赢。各轮耗时和精确累加的适用条件见基准说明。
 
 HENG 全面超越 PyTorch、TensorFlow、JAX 或所有现有框架的说法尚未得到证明。本次交付没有训练模型，也没有建立达到相同模型质量时训练成本更低的证据。
 

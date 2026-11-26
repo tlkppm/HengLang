@@ -136,6 +136,27 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 self.assertIn('print("HENG_THREADS_V1");', source)
                 self.assertIn("print(get_threads());", source)
 
+    def test_extended_input_profiles_pass_frontend_and_match_reference(self):
+        from henglang.frontend import check, parse
+        size = 5
+        for profile in ("dyadic", "rational"):
+            with self.subTest(profile=profile):
+                self.assertEqual(benchmark.parse_arguments(["--input", profile]).input, profile)
+                source = benchmark.heng_source(size, 3, 20, profile)
+                self.assertIn("main", check(parse(source, "comparison.heng")).functions)
+                inputs = [[benchmark.input_value(size, index, side, profile) for index in range(size * size)]
+                          for side in ("left", "right")]
+                left, right = inputs
+                self.assertNotEqual(left, right)
+                if profile == "dyadic":
+                    self.assertTrue(all((value * 65536).is_integer() for matrix in inputs for value in matrix))
+                else:
+                    self.assertTrue(any(not (value * 65536).is_integer() for matrix in inputs for value in matrix))
+                positions = benchmark.sample_positions(size)
+                expected = [math.fsum(left[row * size + inner] * right[inner * size + col]
+                                      for inner in range(size)) for row, col in map(lambda index: divmod(index, size), positions)]
+                self.assertEqual(benchmark.reference_samples(size, profile), expected)
+
     def test_help_needs_no_optional_dependencies_or_project_imports(self):
         result = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "benchmarks" / "compare_frameworks.py"), "--help"],
                                 cwd=ROOT, capture_output=True, encoding="utf-8", timeout=15)

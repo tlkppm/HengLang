@@ -92,6 +92,48 @@ class RuntimeFastpathTests(unittest.TestCase):
             expected.extend([reference] * 6)
         self.assert_printed(self.run_heng("".join("{" + source + "}" for source in sources)).stdout, expected)
 
+    def test_dense_f64_exact_grid_and_compensated_rounding(self):
+        rows, inner, columns = 17, 19, 21
+        generator = random.Random(7511)
+        exact = ([generator.randrange(-4096, 4096) / 2048 for _ in range(rows * inner)],
+                 [generator.randrange(-4096, 4096) / 4096 for _ in range(inner * columns)])
+        general = ([generator.uniform(-2, 2) for _ in range(rows * inner)],
+                   [generator.uniform(-2, 2) for _ in range(inner * columns)])
+        cases = []
+        for left, right in (exact, general):
+            reference = matrix_reference(left, right, rows, inner, columns)
+            a = tensor([0.0] * inner + left, [rows + 1, inner])
+            b = tensor(right, [inner, columns])
+            expected = tensor(reference, [rows, columns])
+            cases.append(f'''{{
+    let a = slice({a}, 0, 1, {rows + 1}, 1);
+    let b = {b};
+    let expected = {expected};
+    for workers in [1, 2, 4] {{
+        set_threads(workers);
+        assert_close(matmul(a, b), expected, 0.0, 0.0);
+    }}
+}}''')
+        self.run_heng("set_optimized(true);\n" + "\n".join(cases))
+
+    def test_dense_f64_handles_subnormal_products_and_nonfinite_outputs(self):
+        rows, inner, columns = 16, 16, 17
+        right = [1.0] * (inner * columns)
+        sources = []
+        expected = []
+        tiny = math.ldexp(1.0, -1074)
+        large = math.ldexp(1.0, 400)
+        for values, value in (([tiny] * inner, tiny * inner),
+                              ([large, -large] + [tiny] * (inner - 2), tiny * (inner - 2)),
+                              ([math.inf, -math.inf] + [1.0] * (inner - 2), math.nan),
+                              ([1e308] * inner, math.inf), ([-0.0] * inner, 0.0)):
+            a = tensor(values * rows, [rows, inner])
+            b = tensor(right, [inner, columns])
+            sources.append(f'{{let c=matmul({a},{b});print(reshape(c,[{rows * columns}]));}}')
+            expected.append([value] * (rows * columns))
+        output = self.run_heng("set_optimized(true);" + "".join(sources)).stdout
+        self.assert_printed(output, expected)
+
     def test_matmul_strided_transposed_and_offset_views(self):
         first = [float(index % 17 - 8) / 8 for index in range(6 * 35)]
         second = [float(index % 23 - 11) / 16 for index in range(37 * 35)]
@@ -201,6 +243,21 @@ class RuntimeFastpathTests(unittest.TestCase):
 
     def test_undefined_behavior_fastpaths(self):
         source = 'fn main() -> void {for dtype_name in ["f64","f32"]{let a=cast(reshape(arange(210),[6,35]),dtype_name);let b=cast(reshape(arange(1295),[35,37]),dtype_name);let left=slice(a,0,5,0,-2);let right=slice(b,1,36,-1,-1);set_optimized(false);let expected=matmul(left,right);set_optimized(true);set_threads(4);assert_close(matmul(left,right),expected,0.0,0.0);let offset=slice(a,0,1,4,1);let one=cast(full([],1.0),dtype_name);assert_close(add(offset,one),add(clone(offset),one),0.0,0.0);assert_close(relu(scale(offset,-0.5)),relu(scale(clone(offset),-0.5)),0.0,0.0);assert_close(fused_affine_relu(offset,1.0000000596046448,-1.0),relu(add(scale(offset,1.0000000596046448),full([],-1.0))),0.0,0.0);assert(numel(mul(cast(zeros([0,3]),dtype_name),one))==0,"空路径错误");}print("PASS fastpath UBSan");}'
+        source = source.replace('print("PASS fastpath UBSan");', '''
+let a = scale(slice(reshape(arange(360), [20, 18]), 0, 1, 20, 1), 0.03125);
+let b = scale(reshape(arange(306), [18, 17]), -0.03125);
+seed(917);
+let general = rand([19, 18]);
+set_optimized(false);
+let exact_expected = matmul(a, b);
+let general_expected = matmul(general, b);
+set_optimized(true);
+for workers in [1, 4] {
+    set_threads(workers);
+    assert_close(matmul(a, b), exact_expected, 0.0, 0.0);
+    assert_close(matmul(general, b), general_expected, 0.0, 0.0);
+}
+print("PASS fastpath UBSan");''')
         directory = ROOT / ".build" / "test-sources"
         directory.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=directory) as temporary:
