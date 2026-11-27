@@ -61,6 +61,37 @@ class AutogradReferenceTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(message, result.stderr)
 
+    def test_reverse_gradients_preserve_signed_zero_nan_and_snapshots(self):
+        self.run_heng('''
+for kind in ["f32","f64"] {
+    let tape=ag_tape();
+    let input=ag_variable(tape,cast(ones([3]),kind),true);
+    let output=ag_scale(tape,input,1.0);
+    let unused=ag_variable(tape,cast(ones([3]),kind),true);
+    let seed=cast(tensor([f64("-0"),f64("nan"),3.0],[3]),kind);
+    let previous=ag_grad(tape,input);
+    let values=ag_vjp(tape,output,seed,[input,output,unused,unused],true);
+    assert(dtype(values[0])==kind && str(item(values[0],0))=="0","首次累加的负零必须变为正零");
+    assert(item(values[0],1)!=item(values[0],1),"NaN 梯度必须传播");
+    assert(str(item(values[1],0))=="-0","输出梯度必须保留种子的负零");
+    assert_close(values[2],zeros([3]),0.0,0.0);
+    set(values[2],[0],5.0);
+    assert(item(values[3],0)==5.0 && item(ag_grad(tape,unused),0)==0.0,"重复请求与未连接梯度必须保持各自的引用语义");
+    let dense=ag_compute_gradients(tape,output,seed);
+    assert(len(dense)==len(tape.nodes) && dtype(dense[unused])==kind,"完整梯度必须包含同类型的未连接节点");
+    assert_close(dense[unused],zeros([3]),0.0,0.0);
+    ag_backward(tape,output,seed,true);
+    let snapshot=ag_grad(tape,input);
+    let output_snapshot=ag_grad(tape,output);
+    ag_backward(tape,output,ones([3]),false);
+    assert(item(previous,2)==0.0 && item(snapshot,2)==3.0,"更新节点梯度时必须保留旧快照");
+    assert(str(item(output_snapshot,0))=="-0" && item(ag_grad(tape,output),0)==1.0,"更新输出梯度时必须保留旧快照");
+    assert(item(ag_grad(tape,input),2)==4.0 && tape.nodes[output].released && !tape.nodes[unused].released,"反传只累加和释放可达节点");
+    ag_backward(tape,input,ones([3]),false);
+    assert(item(ag_grad(tape,input),2)==5.0 && !tape.nodes[input].released,"叶节点可直接反传并在释放后复用");
+}
+''')
+
     def test_all_public_operations_against_independent_reference(self):
         inputs = [0.4, 0.8, 1.3, 1.7, 1.2, 0.4, -0.3, 1.5]
         direction = [0.3, -0.2, 0.5, 0.7, -0.2, 0.6, 0.1, -0.4]

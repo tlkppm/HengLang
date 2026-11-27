@@ -317,12 +317,13 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 self.assertFalse(benchmark.single_thread_configuration_verified(results))
 
     def test_run_returns_sanitized_report_with_dynamic_thread_aggregation(self):
-        args = benchmark.parse_arguments(["--sizes", "2"])
+        args = benchmark.parse_arguments(["--sizes", "2", "--require-win"])
         module = types.SimpleNamespace(__version__="test-version")
-        for heng_verified, framework_verified in ((True, True), (True, False), (False, True), (False, False)):
-            with self.subTest(heng=heng_verified, framework=framework_verified):
+        for heng_verified, framework_verified, ratio in ((True, True, 2.0), (True, True, 1.0), (True, True, 0.5),
+                                                         (True, False, 2.0), (False, True, 2.0), (False, False, 2.0)):
+            with self.subTest(heng=heng_verified, framework=framework_verified, ratio=ratio):
                 heng_timing = {"median_seconds": 1.0, "threads": {"verified": heng_verified}}
-                framework_timing = {"median_seconds": 1.0, "threads": {"verified": framework_verified}}
+                framework_timing = {"median_seconds": ratio, "threads": {"verified": framework_verified}}
                 temporary = mock.MagicMock()
                 temporary.__enter__.return_value = ROOT / ".build" / "unused-test-directory"
                 with mock.patch.object(benchmark, "load_framework", return_value=module), mock.patch.object(benchmark, "runtime_identity", return_value="test-digest"), mock.patch.object(benchmark, "run_heng", return_value=heng_timing), mock.patch.object(benchmark, "framework_benchmark", return_value=framework_timing), mock.patch.object(benchmark, "blas_metadata", return_value={"runtime_libraries": []}), mock.patch.object(benchmark.tempfile, "TemporaryDirectory", return_value=temporary):
@@ -334,7 +335,9 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 self.assertEqual(report["privacy"]["machine_information"], "omitted")
                 self.assertEqual(report["fair_single_thread"], heng_verified and framework_verified)
                 self.assertIn("不保证 CPU 调度隔离", report["fair_single_thread_meaning"])
-                self.assertEqual(report["results"][0]["frameworks"]["numpy"]["ratio_framework_over_heng"], 1.0)
+                self.assertEqual(report["results"][0]["frameworks"]["numpy"]["ratio_framework_over_heng"], ratio)
+                self.assertEqual(report["status"], "PASS" if heng_verified and framework_verified and ratio > 1.0 else "FAIL")
+                self.assertEqual(len(report["performance_requirement"]["non_wins"]), int(ratio <= 1.0))
                 self.assertIn("blas", report["versions"])
                 self.assertNotIn(str(ROOT), json.dumps(report))
                 temporary.__exit__.assert_called_once()

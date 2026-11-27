@@ -72,9 +72,34 @@ fn opt_fixture_clipping_schedule() {
     assert_close(ag_grad(tape,parameter),zeros([2]),0.000000001,0.000000001);
 }
 
+fn opt_fixture_adam_fused_matches_composition() {
+    let tape=ag_tape();
+    let initial=tensor([0.125,1.0,-3.0,2.0,0.0],[5]);
+    let first=ag_variable(tape,clone(initial),true);
+    let second=ag_variable(tape,clone(initial),true);
+    let fused=opt_adamw(tape,[first],0.13,0.82,0.979,0.00000001,0.2);
+    let composed=opt_adamw(tape,[second],0.13,0.82,0.979,0.00000001,0.2);
+    let base=tensor([1.25,-3.1,0.015,0.0,-2.1],[5]);
+    for step in [1,2,3,4] {
+        let gradient=scale(base,f64(step));
+        tape.nodes[first].grad=gradient;
+        tape.nodes[second].grad=gradient;
+        set_optimized(false);
+        opt_step(tape,composed);
+        set_optimized(true);
+        opt_step(tape,fused);
+        assert_close(ag_value(tape,first),ag_value(tape,second),0.0,0.0);
+        assert_close(fused.first[0],composed.first[0],0.0,0.0);
+        assert_close(fused.second[0],composed.second[0],0.0,0.0);
+        assert_close(ag_grad(tape,first),gradient,0.0,0.0);
+    }
+    assert_close(initial,tensor([0.125,1.0,-3.0,2.0,0.0],[5]),0.0,0.0);
+}
+
 fn main() {
     opt_fixture_sgd_momentum();
     opt_fixture_adaptive();
     opt_fixture_clipping_schedule();
+    opt_fixture_adam_fused_matches_composition();
     print("PASS: SGD、Momentum、Nesterov、Adam、AdamW、RMSprop、梯度裁剪与调度");
 }

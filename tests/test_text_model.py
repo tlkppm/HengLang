@@ -5,7 +5,7 @@ import subprocess
 import sys
 import unittest
 
-from benchmarks.train_text_model import ROOT, PROMPTS, corpus, decode_generation, ExperimentError
+from benchmarks.train_text_model import ROOT, PROMPTS, corpus, decode_generation, ExperimentError, parse_arguments
 
 
 class TextModelTests(unittest.TestCase):
@@ -20,6 +20,12 @@ class TextModelTests(unittest.TestCase):
         for invalid in ([], [1], [0, 2], [3, 0], [True, 0]):
             with self.subTest(invalid=invalid), self.assertRaises(ExperimentError):
                 decode_generation("a", invalid, "\nab", 4)
+
+    def test_training_speed_requirement_needs_a_timed_numpy_comparison(self):
+        for invalid in (["--require-win"], ["--require-win", "--numpy", "--smoke"]):
+            with self.subTest(arguments=invalid), self.assertRaises(ExperimentError):
+                parse_arguments(invalid)
+        self.assertTrue(parse_arguments(["--require-win", "--numpy"]).require_win)
 
     def test_native_smoke_trains_and_reports_unseen_examples(self):
         result = subprocess.run(

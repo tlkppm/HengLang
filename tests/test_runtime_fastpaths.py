@@ -132,6 +132,30 @@ class RuntimeFastpathTests(unittest.TestCase):
 }}''')
         self.run_heng("set_optimized(true);\n" + "\n".join(cases))
 
+    def test_sparse_left_dense_fma_matches_independent_reference(self):
+        rows, inner, columns = 17, 19, 13
+        generator = random.Random(419)
+        left = [0.0] * (rows * inner)
+        for row in range(rows - 1):
+            left[row * inner + row % inner] = 1.0
+            left[row * inner + (row + 2) % inner] = -0.75
+        right = [generator.uniform(-2, 2) for _ in range(inner * columns)]
+        expected = tensor(matrix_reference(left, right, rows, inner, columns), [rows, columns])
+        self.run_heng(f'''
+let a = {tensor(left, [rows, inner])};
+let b = {tensor(right, [inner, columns])};
+let transposed = transpose(clone(transpose(a, [1, 0])), [1, 0]);
+let expected = {expected};
+for workers in [1, 4] {{
+    set_threads(workers);
+    set_matmul_fast(true);
+    assert_close(matmul(a, b), expected, 0.000000000001, 0.000000000001);
+    assert_close(matmul(transposed, b), expected, 0.000000000001, 0.000000000001);
+    set_matmul_fast(false);
+    assert_close(matmul(transposed, b), expected, 0.0, 0.0);
+}}
+''')
+
     def test_dense_f64_handles_subnormal_products_and_nonfinite_outputs(self):
         rows, inner, columns = 16, 16, 17
         right = [1.0] * (inner * columns)

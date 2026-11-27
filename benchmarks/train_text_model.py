@@ -37,11 +37,14 @@ def parse_arguments(arguments):
     extent.add_argument("--epochs", type=int, help=f"训练轮数，默认 {DEFAULT_EPOCHS}，允许 1 至 100")
     extent.add_argument("--smoke", action="store_true", help="执行一轮训练和生成，不调用训练计时器")
     parser.add_argument("--numpy", action="store_true", help="在 HENG 之后串行运行 NumPy 手写基线")
+    parser.add_argument("--require-win", action="store_true", help="要求模型指标与续写一致，且 HENG 在核实单线程后严格更快")
     parser.add_argument("--heng-matmul", choices=("default", "strict", "fast"), default="default",
                         help="strict 或 fast 通过 set_matmul_fast 显式切换路径，默认沿用运行时设置")
     parser.add_argument("--timeout", type=float, default=120.0, help="HENG 程序执行超时秒数")
     parser.add_argument("--build-timeout", type=float, default=300.0, help="HENG 构建与执行的总超时秒数")
     args = parser.parse_args(arguments)
+    if args.require_win and (not args.numpy or args.smoke):
+        raise ExperimentError("--require-win 需要 NumPy 对照和正式训练计时")
     if args.epochs is not None and not 1 <= args.epochs <= 100:
         raise ExperimentError("训练轮数必须在 1 至 100 之间")
     if not 0 < args.timeout <= args.build_timeout < math.inf:
@@ -346,6 +349,11 @@ def run(args):
         report["comparison"] = comparison
         if not comparison["metrics_match"]:
             report["status"] = "FAIL"
+        if args.require_win:
+            ratio = comparison["numpy_over_heng_training_time"]
+            passed = comparison["metrics_match"] and comparison["generations_match"] and ratio is not None and ratio > 1.0
+            report["performance_requirement"] = "PASS" if passed else "FAIL"
+            report["status"] = report["performance_requirement"]
     return report
 
 

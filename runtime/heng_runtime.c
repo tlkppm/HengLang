@@ -420,7 +420,9 @@ static HValue tensor_reduce_shape(HObject *source,HValue target){HValue result=t
 #ifdef __clang__
 #pragma STDC FP_CONTRACT OFF
 #endif
-typedef enum MatmulDenseMode { MATMUL_DENSE_OFF, MATMUL_DENSE_COMPENSATED, MATMUL_DENSE_FMA, MATMUL_DENSE_FMA_F32 } MatmulDenseMode;
+typedef enum MatmulDenseMode {
+    MATMUL_DENSE_OFF, MATMUL_DENSE_COMPENSATED, MATMUL_DENSE_FMA, MATMUL_DENSE_FMA_F32, MATMUL_DENSE_SPARSE_LEFT
+} MatmulDenseMode;
 typedef struct MatmulJob {
     HObject *left,*right,*output;
     int64_t begin,end,m,n,k,batch_rank;
@@ -514,6 +516,25 @@ static int matmul_f32_exponent(HObject *tensor,int *exponent){
     return 1;
 }
 
+__attribute__((target("avx")))
+static int matmul_sparse_left(const double *values,int64_t count){
+    static const unsigned char counts[16]={0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4};
+    int64_t remaining=count/8,index=0;
+    __m256d zero=_mm256_setzero_pd();
+    if(count>=8){
+        __m256d first=_mm256_cmp_pd(_mm256_loadu_pd(values),zero,_CMP_NEQ_OQ);
+        __m256d second=_mm256_cmp_pd(_mm256_loadu_pd(values+4),zero,_CMP_NEQ_OQ);
+        if(_mm256_movemask_pd(_mm256_and_pd(first,second))==15)return 0;
+    }
+    for(;count-index>=4;index+=4){
+        int mask=_mm256_movemask_pd(_mm256_cmp_pd(_mm256_loadu_pd(values+index),zero,_CMP_NEQ_OQ));
+        remaining-=counts[mask];
+        if(remaining<0)return 0;
+    }
+    for(;index<count;index++)if(values[index]!=0&&--remaining<0)return 0;
+    return 1;
+}
+
 static MatmulDenseMode matmul_dense_mode(MatmulJob *job){
     HObject *left=job->left,*right=job->right;
     if(!job->blocked||job->batch_rank||job->m<8||job->n<MATMUL_PANEL_COLUMNS||job->k<8||job->k>MATMUL_PANEL_MAX_INNER||
@@ -534,7 +555,10 @@ static MatmulDenseMode matmul_dense_mode(MatmulJob *job){
     if(!matmul_max_exponent(first,left->as.tensor.count,&left_exponent)||
        !matmul_max_exponent(second,right->as.tensor.count,&right_exponent)||
        left_exponent+right_exponent+growth>DBL_MAX_EXP-1)return MATMUL_DENSE_OFF;
-    if(matmul_fast)return MATMUL_DENSE_FMA;
+    if(matmul_fast){
+        if(right->as.tensor.strides[1]==1&&matmul_sparse_left(first,left->as.tensor.count))return MATMUL_DENSE_SPARSE_LEFT;
+        return MATMUL_DENSE_FMA;
+    }
     int left_bits=(DBL_MANT_DIG-growth)/2,right_bits=DBL_MANT_DIG-growth-left_bits;
     if(left_exponent < -450||left_exponent > 450||right_exponent < -450||right_exponent > 450||
        !matmul_on_binary_grid(first,left->as.tensor.count,left_bits-left_exponent)||
@@ -607,22 +631,27 @@ DEFINE_MATMUL_FMA_PANEL(matmul_fma_panel_f32,float,__m256,8,_mm256_setzero_ps,_m
 __attribute__((target("avx")))
 static void matmul_compensated_panel(const double *left,const double *panel,double *output,int64_t rows,int64_t inner,int64_t columns){
     int64_t row=0;
-    for(;rows-row>=2;row+=2){
-        __m256d sum00=_mm256_setzero_pd(),sum01=sum00,sum10=sum00,sum11=sum00;
-        __m256d correction00=sum00,correction01=sum00,correction10=sum00,correction11=sum00;
+    for(;rows-row>=3;row+=3){
+        __m256d sum00=_mm256_setzero_pd(),sum01=sum00,sum10=sum00,sum11=sum00,sum20=sum00,sum21=sum00;
+        __m256d correction00=sum00,correction01=sum00,correction10=sum00,correction11=sum00,correction20=sum00,correction21=sum00;
         const double *first=left+row*inner;
         for(int64_t index=0;index<inner;index++){
             MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
-            __m256d a0=_mm256_broadcast_sd(first+index),a1=_mm256_broadcast_sd(first+inner+index);
-            MATMUL_COMPENSATE(sum00,correction00,_mm256_mul_pd(a0,b0));
-            MATMUL_COMPENSATE(sum01,correction01,_mm256_mul_pd(a0,b1));
-            MATMUL_COMPENSATE(sum10,correction10,_mm256_mul_pd(a1,b0));
-            MATMUL_COMPENSATE(sum11,correction11,_mm256_mul_pd(a1,b1));
+            __m256d a=_mm256_broadcast_sd(first+index);
+            MATMUL_COMPENSATE(sum00,correction00,_mm256_mul_pd(a,b0));
+            MATMUL_COMPENSATE(sum01,correction01,_mm256_mul_pd(a,b1));
+            a=_mm256_broadcast_sd(first+inner+index);
+            MATMUL_COMPENSATE(sum10,correction10,_mm256_mul_pd(a,b0));
+            MATMUL_COMPENSATE(sum11,correction11,_mm256_mul_pd(a,b1));
+            a=_mm256_broadcast_sd(first+2*inner+index);
+            MATMUL_COMPENSATE(sum20,correction20,_mm256_mul_pd(a,b0));
+            MATMUL_COMPENSATE(sum21,correction21,_mm256_mul_pd(a,b1));
         }
         MATMUL_STORE_ROW(sum00,sum01,output+row*columns);
         MATMUL_STORE_ROW(sum10,sum11,output+(row+1)*columns);
+        MATMUL_STORE_ROW(sum20,sum21,output+(row+2)*columns);
     }
-    if(row<rows){
+    for(;row<rows;row++){
         __m256d sum0=_mm256_setzero_pd(),sum1=sum0,correction0=sum0,correction1=sum0;
         for(int64_t index=0;index<inner;index++){
             MATMUL_LOAD_PANEL(panel+index*MATMUL_PANEL_COLUMNS);
@@ -637,6 +666,31 @@ static void matmul_compensated_panel(const double *left,const double *panel,doub
 #undef MATMUL_LOAD_PANEL
 #undef MATMUL_STORE_ROW
 
+__attribute__((target("avx")))
+static void matmul_pack_transpose(const double *source,double *target,int64_t rows,int64_t columns,
+                                  int64_t source_stride,int64_t target_stride){
+    int64_t row=0;
+    for(;rows-row>=4;row+=4){
+        int64_t column=0;
+        for(;columns-column>=4;column+=4){
+            const double *input=source+row*source_stride+column;
+            __m256d a=_mm256_loadu_pd(input),b=_mm256_loadu_pd(input+source_stride);
+            __m256d c=_mm256_loadu_pd(input+2*source_stride),d=_mm256_loadu_pd(input+3*source_stride);
+            __m256d low_ab=_mm256_unpacklo_pd(a,b),high_ab=_mm256_unpackhi_pd(a,b);
+            __m256d low_cd=_mm256_unpacklo_pd(c,d),high_cd=_mm256_unpackhi_pd(c,d);
+            double *output=target+column*target_stride+row;
+            _mm256_storeu_pd(output,_mm256_permute2f128_pd(low_ab,low_cd,0x20));
+            _mm256_storeu_pd(output+target_stride,_mm256_permute2f128_pd(high_ab,high_cd,0x20));
+            _mm256_storeu_pd(output+2*target_stride,_mm256_permute2f128_pd(low_ab,low_cd,0x31));
+            _mm256_storeu_pd(output+3*target_stride,_mm256_permute2f128_pd(high_ab,high_cd,0x31));
+        }
+        for(;column<columns;column++)
+            for(int64_t lane=0;lane<4;lane++)target[column*target_stride+row+lane]=source[(row+lane)*source_stride+column];
+    }
+    for(;row<rows;row++)
+        for(int64_t column=0;column<columns;column++)target[column*target_stride+row]=source[row*source_stride+column];
+}
+
 static void matmul_pack_left(MatmulJob *job){
     HObject *tensor=job->left;
     if(tensor->as.tensor.strides[1]==1)return;
@@ -644,10 +698,33 @@ static void matmul_pack_left(MatmulJob *job){
     job->packed_left=allocate_storage(checked_size((size_t)tensor->as.tensor.count,sizeof(double)));
     for(int64_t start=0;start<job->m;){
         int64_t rows=job->m-start>16?16:job->m-start;
-        for(int64_t index=0;index<job->k;index++)
-            for(int64_t row=0;row<rows;row++)
-                job->packed_left[(start+row)*job->k+index]=source[index*job->m+start+row];
+        matmul_pack_transpose(source+start,job->packed_left+start*job->k,job->k,rows,job->m,job->k);
         start+=rows;
+    }
+}
+
+__attribute__((target("avx,fma")))
+static void matmul_sparse_left_f64(MatmulJob *job){
+    int64_t inner=job->k,columns=job->n;
+    const double *left=job->packed_left;
+    if(!left)left=(const double*)job->left->as.tensor.storage->as.storage.data+job->left->as.tensor.offset;
+    const double *right=(const double*)job->right->as.tensor.storage->as.storage.data+job->right->as.tensor.offset;
+    double *output=job->output->as.tensor.storage->as.storage.data;
+    for(int64_t row=job->begin;row<job->end;row++){
+        double *target=output+row*columns;
+        memset(target,0,(size_t)columns*sizeof(double));
+        for(int64_t index=0;index<inner;index++){
+            double coefficient=left[row*inner+index];
+            if(coefficient==0)continue;
+            const double *source=right+index*columns;
+            __m256d weight=_mm256_set1_pd(coefficient);
+            int64_t column=0;
+            for(;columns-column>=4;column+=4){
+                __m256d values=_mm256_loadu_pd(source+column),total=_mm256_loadu_pd(target+column);
+                _mm256_storeu_pd(target+column,_mm256_fmadd_pd(weight,values,total));
+            }
+            for(;column<columns;column++)target[column]=fma(coefficient,source[column],target[column]);
+        }
     }
 }
 
@@ -666,9 +743,7 @@ static void matmul_dense_f64(MatmulJob *job){
             for(int64_t index=0;index<inner;index++)
                 memcpy(panel+index*MATMUL_PANEL_COLUMNS,right+index*right_row+column,MATMUL_PANEL_COLUMNS*sizeof(double));
         }else{
-            for(int64_t lane=0;lane<MATMUL_PANEL_COLUMNS;lane++)
-                for(int64_t index=0;index<inner;index++)
-                    panel[index*MATMUL_PANEL_COLUMNS+lane]=right[(column+lane)*right_column+index];
+            matmul_pack_transpose(right+column*right_column,panel,MATMUL_PANEL_COLUMNS,inner,right_column,MATMUL_PANEL_COLUMNS);
         }
         if(job->dense_mode==MATMUL_DENSE_FMA)matmul_fma_panel(left,panel,output+column,rows,inner,columns);
         else matmul_compensated_panel(left,panel,output+column,rows,inner,columns);
@@ -746,6 +821,7 @@ static void matmul_run(MatmulJob *job){HObject *left=job->left,*right=job->right
 static void matmul_rows(MatmulJob *job){
 #if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
     if(job->dense_mode==MATMUL_DENSE_FMA_F32){matmul_dense_f32(job);return;}
+    if(job->dense_mode==MATMUL_DENSE_SPARSE_LEFT){matmul_sparse_left_f64(job);return;}
     if(job->dense_mode){matmul_dense_f64(job);return;}
 #endif
     matmul_run(job);
@@ -890,6 +966,49 @@ static int tensor_unary_float(const char *name,HObject *source,HObject *output,d
 }
 #undef FLOAT_UNARY_TYPES
 #undef FLOAT_UNARY_LOOP
+
+#ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
+#endif
+static HValue tensor_adam_f64(HValue *arguments){
+    HObject *value=require(arguments[0],H_TENSOR);
+    const double *inputs[4];
+    size_t shape_bytes=(size_t)value->as.tensor.rank*sizeof(int64_t);
+    if(!optimized)return hv_list(0,NULL);
+    for(int index=0;index<4;index++){
+        HObject *tensor=require(arguments[index],H_TENSOR);
+        if(tensor_dtype(tensor)!=D_F64||tensor->as.tensor.rank!=value->as.tensor.rank||
+           memcmp(tensor->as.tensor.shape,value->as.tensor.shape,shape_bytes)||!tensor_contiguous(tensor))return hv_list(0,NULL);
+        inputs[index]=(const double*)tensor->as.tensor.storage->as.storage.data+tensor->as.tensor.offset;
+    }
+    double beta1=hv_number(arguments[4]),beta2=hv_number(arguments[5]);
+    double first_correction=hv_number(arguments[6]),second_correction=hv_number(arguments[7]);
+    double epsilon=hv_number(arguments[8]),rate=hv_number(arguments[9]),decay=hv_number(arguments[10]);
+    if(!(epsilon>0))return hv_list(0,NULL);
+    HValue output[3];
+    double *destinations[3];
+    for(int index=0;index<3;index++){
+        output[index]=tensor_allocate(value->as.tensor.rank,value->as.tensor.shape,D_F64,0);
+        destinations[index]=output[index].as.obj->as.tensor.storage->as.storage.data;
+    }
+    const double *weights=inputs[0],*gradients=inputs[1],*first_input=inputs[2],*second_input=inputs[3];
+    double *weights_next=destinations[0],*first_next=destinations[1],*second_next=destinations[2];
+    double first_weight=1.0-beta1,second_weight=1.0-beta2;
+    for(int64_t index=0;index<value->as.tensor.count;index++){
+        double grad=gradients[index];
+        double first=first_input[index]*beta1+grad*first_weight;
+        double second=second_input[index]*beta2+(grad*grad)*second_weight;
+        double update=(first*first_correction)/(sqrt(second*second_correction)+epsilon);
+        double next=weights[index]-update*rate;
+        weights_next[index]=decay>0?next-weights[index]*(rate*decay):next;
+        first_next[index]=first;
+        second_next[index]=second;
+    }
+    return hv_list(3,output);
+}
+#ifdef __clang__
+#pragma STDC FP_CONTRACT DEFAULT
+#endif
 static HValue native_dispatch(const char *name,int64_t count,HValue *arguments);
 typedef struct BuiltinSignature { const char *name; int count; } BuiltinSignature;
 static const BuiltinSignature signatures[]={
@@ -897,7 +1016,7 @@ static const BuiltinSignature signatures[]={
     {"tensor",2},{"zeros",1},{"ones",1},{"full",2},{"arange",1},{"rand",1},{"randn",1},{"seed",1},{"rng_state",0},{"rng_restore",1},{"shape",1},{"rank",1},{"numel",1},{"dtype",1},{"cast",2},{"item",2},{"get",2},{"set",3},{"tensor_version",1},{"clone",1},
     {"add",2},{"sub",2},{"mul",2},{"div",2},{"scale",2},{"pow",2},{"exp",1},{"log",1},{"sqrt",1},{"tanh",1},{"sigmoid",1},{"relu",1},{"abs",1},{"sign",1},{"greater",2},{"equal",2},
     {"reshape",2},{"transpose",2},{"slice",5},{"concat",3},{"gather",3},{"scatter_add",4},{"broadcast_to",2},{"reduce_to_shape",2},{"sum",3},{"sum_all",1},{"mean",3},{"max",3},{"argmax",2},{"matmul",2},{"softmax",2},{"unfold2d",5},{"fold2d",6},
-    {"coo",5},{"csr",5},{"sparse_dense",1},{"sparse_matmul",2},{"sparse_transpose",1},{"set_threads",1},{"get_threads",0},{"set_optimized",1},{"set_matmul_fast",1},{"fused_affine_relu",3},{"gc_collect",0},{"live_objects",0},{"memory_bytes",0},{"peak_memory_bytes",0},{"allocation_count",0},{"buffer_reuse_count",0},{"cached_memory_bytes",0},{"system_allocation_count",0},{"trim_buffers",0},{"clock",0},{"state_save",4},{"state_tensors",1},{"state_ints",1},{"state_floats",1}
+    {"coo",5},{"csr",5},{"sparse_dense",1},{"sparse_matmul",2},{"sparse_transpose",1},{"set_threads",1},{"get_threads",0},{"set_optimized",1},{"set_matmul_fast",1},{"adam_f64",11},{"fused_affine_relu",3},{"gc_collect",0},{"live_objects",0},{"memory_bytes",0},{"peak_memory_bytes",0},{"allocation_count",0},{"buffer_reuse_count",0},{"cached_memory_bytes",0},{"system_allocation_count",0},{"trim_buffers",0},{"clock",0},{"state_save",4},{"state_tensors",1},{"state_ints",1},{"state_floats",1}
 };
 HValue hv_native(const char *name,int64_t count,HValue *arguments){if(!name||count<0||(count&&!arguments))hv_fail("内置调用参数无效");int found=0;for(size_t index=0;index<sizeof(signatures)/sizeof(signatures[0]);index++)if(!strcmp(name,signatures[index].name)){found=1;if(count!=signatures[index].count)hv_fail("内置参数数量不匹配");break;}if(!found)hv_fail("未知内置函数");HFrame frame;hv_frame_push(&frame,arguments,(size_t)count);HValue result=native_dispatch(name,count,arguments);hv_frame_pop(&frame);return result;}
 static HValue native_dispatch(const char *name,int64_t count,HValue *arguments){
@@ -934,6 +1053,7 @@ static HValue native_dispatch(const char *name,int64_t count,HValue *arguments){
     if(!strcmp(name,"get_threads"))return hv_i64(thread_count);
     if(!strcmp(name,"set_optimized")){optimized=hv_truth(arguments[0]);return hv_void();}
     if(!strcmp(name,"set_matmul_fast")){matmul_fast=hv_truth(arguments[0]);return hv_void();}
+    if(!strcmp(name,"adam_f64"))return tensor_adam_f64(arguments);
     if(!strcmp(name,"seed")){int64_t seed=hv_integer(arguments[0]);memcpy(&rng,&seed,8);if(!rng)rng=UINT64_C(88172645463325252);return hv_void();}
     if(!strcmp(name,"rng_state")){int64_t state;memcpy(&state,&rng,8);return hv_i64(state);}
     if(!strcmp(name,"rng_restore")){int64_t state=hv_integer(arguments[0]);if(!state)hv_fail("随机数状态不能为零");memcpy(&rng,&state,8);return hv_void();}

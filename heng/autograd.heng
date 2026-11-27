@@ -124,12 +124,14 @@ fn ag_record(tape:AGTape,value:Tensor,parents:List<i64>,op:i64,axes:List<i64>,di
     return len(tape.nodes)-1;
 }
 
-fn ag_reachable(tape:AGTape,output:i64)->List<bool> {
+fn ag_trace_reachable(tape:AGTape,output:i64,include_suffix:bool)->List<bool> {
     assert(output>=0 && output<len(tape.nodes),"输出节点不存在");
     assert(tape.nodes[output].requires_grad,"输出节点不需要梯度");
     let visited:List<bool>=[];
+    var count=output+1;
+    if include_suffix { count=len(tape.nodes); }
     var index:i64=0;
-    while index<len(tape.nodes) { push(visited,index==output); index=index+1; }
+    while index<count { push(visited,index==output); index=index+1; }
     index=output;
     while index>=0 {
         if visited[index] {
@@ -147,6 +149,10 @@ fn ag_reachable(tape:AGTape,output:i64)->List<bool> {
         index=index-1;
     }
     return visited;
+}
+
+fn ag_reachable(tape:AGTape,output:i64)->List<bool> {
+    return ag_trace_reachable(tape,output,true);
 }
 
 fn ag_swap_last(value:Tensor)->Tensor {
@@ -260,21 +266,53 @@ fn ag_pullback(tape:AGTape,node:AGNode,edge:i64,incoming:Tensor)->Tensor {
     return zeros(shape(left));
 }
 
-fn ag_compute_gradients(tape:AGTape,output:i64,seed_value:Tensor)->List<Tensor> {
-    let visited=ag_reachable(tape,output);
-    assert(ag_same_shape(shape(seed_value),shape(tape.nodes[output].data)),"反向种子形状不一致");
+fn ag_first_gradient(reference:Tensor,contribution:Tensor,zero_f64:Tensor,zero_f32:Tensor)->Tensor {
+    let dimensions=shape(reference);
+    if ag_same_shape(dimensions,shape(contribution)) {
+        let kind=dtype(reference);
+        if kind=="f64" { return add(zero_f64,contribution); }
+        if kind=="f32" { return ag_match_type(add(zero_f32,contribution),reference); }
+    }
+    return ag_match_type(add(ag_match_type(zeros(dimensions),reference),contribution),reference);
+}
+
+fn ag_gradient_at(tape:AGTape,index:i64,slots:List<i64>,gradients:List<Tensor>)->Tensor {
+    let slot=slots[index];
+    if slot>=0 { return gradients[slot]; }
+    let zero=ag_zeros_like(tape.nodes[index].data);
+    slots[index]=len(gradients);
+    push(gradients,zero);
+    return zero;
+}
+
+fn ag_reverse(tape:AGTape,output:i64,seed_value:Tensor,visited:List<bool>,slots:List<i64>)->List<Tensor> {
+    let output_data=tape.nodes[output].data;
+    assert(ag_same_shape(shape(seed_value),shape(output_data)),"反向种子形状不一致");
     assert(dtype(seed_value)=="f32" || dtype(seed_value)=="f64","反向种子必须为浮点张量");
-    let gradients:List<Tensor>=[];
-    for node in tape.nodes { push(gradients,ag_zeros_like(node.data)); }
-    gradients[output]=ag_match_type(seed_value,tape.nodes[output].data);
-    var index=output;
+    let gradients:List<Tensor>=[ag_match_type(seed_value,output_data)];
+    var index:i64=0;
+    let count=len(visited);
+    while index<count { push(slots,-1); index=index+1; }
+    slots[output]=0;
+    let zero_f64=zeros([]);
+    let zero_f32=cast(zero_f64,"f32");
+    index=output;
     while index>=0 {
         if visited[index] {
             let node=tape.nodes[index];
             if node.requires_grad && node.op!=0 {
+                let incoming=ag_gradient_at(tape,index,slots,gradients);
                 var edge:i64=0;
                 for parent in node.parents {
-                    if tape.nodes[parent].requires_grad { gradients[parent]=ag_match_type(add(gradients[parent],ag_pullback(tape,node,edge,gradients[index])),tape.nodes[parent].data); }
+                    let parent_node=tape.nodes[parent];
+                    if parent_node.requires_grad {
+                        let contribution=ag_pullback(tape,node,edge,incoming);
+                        let slot=slots[parent];
+                        if slot<0 {
+                            slots[parent]=len(gradients);
+                            push(gradients,ag_first_gradient(parent_node.data,contribution,zero_f64,zero_f32));
+                        } else { gradients[slot]=ag_match_type(add(gradients[slot],contribution),parent_node.data); }
+                    }
                     edge=edge+1;
                 }
             }
@@ -284,47 +322,75 @@ fn ag_compute_gradients(tape:AGTape,output:i64,seed_value:Tensor)->List<Tensor> 
     return gradients;
 }
 
-fn ag_release(tape:AGTape,output:i64) {
+fn ag_compute_gradients(tape:AGTape,output:i64,seed_value:Tensor)->List<Tensor> {
     let visited=ag_reachable(tape,output);
+    let slots:List<i64>=[];
+    let gradients=ag_reverse(tape,output,seed_value,visited,slots);
+    let values:List<Tensor>=[];
     var index:i64=0;
-    while index<len(tape.nodes) {
-        let node=tape.nodes[index];
-        if visited[index] && node.op!=0 {
-            clear(node.parents);
-            clear(node.parent_revisions);
-            clear(node.axes);
-            clear(node.dims);
-            node.released=true;
+    while index<len(slots) {
+        push(values,ag_gradient_at(tape,index,slots,gradients));
+        index=index+1;
+    }
+    return values;
+}
+
+fn ag_release_node(node:AGNode) {
+    clear(node.parents);
+    clear(node.parent_revisions);
+    clear(node.axes);
+    clear(node.dims);
+    node.released=true;
+}
+
+fn ag_release_reachable(tape:AGTape,visited:List<bool>,output:i64) {
+    var index:i64=0;
+    while index<=output {
+        if visited[index] {
+            let node=tape.nodes[index];
+            if node.op!=0 { ag_release_node(node); }
         }
         index=index+1;
     }
     tape.consumed=true;
 }
 
+fn ag_release(tape:AGTape,output:i64) {
+    let visited=ag_trace_reachable(tape,output,false);
+    ag_release_reachable(tape,visited,output);
+}
+
 fn ag_backward(tape:AGTape,output:i64,seed_value:Tensor,retain:bool) {
-    let visited=ag_reachable(tape,output);
-    let gradients=ag_compute_gradients(tape,output,seed_value);
+    let visited=ag_trace_reachable(tape,output,false);
+    let slots:List<i64>=[];
+    let gradients=ag_reverse(tape,output,seed_value,visited,slots);
     var index:i64=0;
-    while index<len(tape.nodes) {
-        let node=tape.nodes[index];
-        if visited[index] && node.requires_grad {
-            if node.op==0 { node.grad=ag_match_type(add(node.grad,gradients[index]),node.data); }
-            else { node.grad=gradients[index]; }
+    while index<=output {
+        if visited[index] {
+            let node=tape.nodes[index];
+            if node.requires_grad {
+                let gradient=ag_gradient_at(tape,index,slots,gradients);
+                if node.op==0 { node.grad=ag_match_type(add(node.grad,gradient),node.data); }
+                else { node.grad=gradient; }
+            }
+            if !retain && node.op!=0 { ag_release_node(node); }
         }
         index=index+1;
     }
-    if !retain { ag_release(tape,output); }
+    if !retain { tape.consumed=true; }
 }
 
 fn ag_vjp(tape:AGTape,output:i64,seed_value:Tensor,inputs:List<i64>,retain:bool)->List<Tensor> {
-    let gradients=ag_compute_gradients(tape,output,seed_value);
+    let visited=ag_reachable(tape,output);
+    let slots:List<i64>=[];
+    let gradients=ag_reverse(tape,output,seed_value,visited,slots);
     let values:List<Tensor>=[];
     for input in inputs {
         assert(input>=0 && input<len(tape.nodes),"VJP 输入节点不存在");
         assert(tape.nodes[input].requires_grad,"VJP 输入必须为可微节点");
-        push(values,gradients[input]);
+        push(values,ag_gradient_at(tape,input,slots,gradients));
     }
-    if !retain { ag_release(tape,output); }
+    if !retain { ag_release_reachable(tape,visited,output); }
     return values;
 }
 

@@ -116,6 +116,21 @@ fn opt_step(tape:AGTape,optimizer:OPTOptimizer) {
         let original_gradient=ag_grad(tape,parameter);
         var gradient=original_gradient;
         if optimizer.weight_decay>0.0 && optimizer.kind!=2 { gradient=add(gradient,scale(value,optimizer.weight_decay)); }
+        if optimizer.kind==1 || optimizer.kind==2 {
+            var decay=0.0;
+            if optimizer.kind==2 { decay=optimizer.weight_decay; }
+            let merged=adam_f64(value,gradient,optimizer.first[index],optimizer.second[index],optimizer.beta1,optimizer.beta2,
+                                first_correction,second_correction,optimizer.epsilon,optimizer.learning_rate,decay);
+            if len(merged)>0 {
+                optimizer.first[index]=merged[1];
+                optimizer.second[index]=merged[2];
+                optimizer.third[index]=ag_match_type(optimizer.third[index],value);
+                ag_assign(tape,parameter,merged[0]);
+                tape.nodes[parameter].grad=original_gradient;
+                index=index+1;
+                continue;
+            }
+        }
         var update=gradient;
         if optimizer.kind==0 {
             if optimizer.momentum>0.0 {

@@ -97,7 +97,7 @@ At the start of the follow-up, the same `affine` test on the previous commit too
 
 Run `python -B benchmarks/compare_frameworks.py --input rational --dtype f64 --layout contiguous --matmul-fast`. Change `--dtype` to `f32` for single precision. Set `--layout` to `right-transposed` or `both-transposed` to test a different physical layout with the same logical input values. Omit `--matmul-fast` for the default compensated mode. Eligible `f64` matrices can use packed kernels with either storage layout. The `f32` fast kernel requires contiguous row-major matrices, and it accumulates in `f32`. Unsupported layouts and inputs with unsafe accumulation bounds use the existing path. Fast mode can change results through rounding.
 
-The following are the final runtime's three runs using the same NumPy/OpenBLAS versions, per-run sample counts and verified single compute-thread configuration. The reported ratio divides NumPy time by HENG time, so a value above one favors HENG.
+The preceding release's three runs used the same NumPy/OpenBLAS versions, per-run sample counts, and verified single compute-thread configuration. The reported ratio divides NumPy time by HENG time, so a value above one favors HENG.
 
 - Fast `f64`, contiguous: 128 led in 3 of 3 runs, with ratios 1.35 to 1.79. At 256 the ratios were 0.98, 1.04, and 1.81.
 - Fast `f64`, right transposed: 128 and 256 both led in 3 of 3 runs, with ratios 1.23 to 1.77 and 1.07 to 1.68, respectively.
@@ -107,7 +107,17 @@ The following are the final runtime's three runs using the same NumPy/OpenBLAS v
 
 Every sampled result passed the independent reference check. The largest observed HENG sample errors were `5.56e-16` for `f64` fast mode and `2.80e-7` for `f32` fast mode. Timings varied between runs, particularly at 256.
 
-#### Character model training
+#### Per-workload performance requirement
+
+Add `--require-win` to the matrix driver to require verified single-thread settings and a strictly lower HENG median for every selected matrix size and library. A tie, a slower result, or unverified threads makes the command fail. The training driver accepts `--numpy --require-win` and also requires matching evaluation scores and generated text. Both commands retain the measured results when the speed requirement fails.
+
+The latest runtime packs transposed matrices in vector tiles and processes more independent outputs together during compensated accumulation. The optional fast mode can skip zero coefficients when the eligible left operand is sparse and the right operand is contiguous. The optimized Adam and AdamW path combines the double-precision moment updates and parameter update in one traversal. Reverse-mode differentiation reuses the validated graph traversal and initializes gradient storage as needed.
+
+The latest three runs retained the two sizes, the previous input profiles and precision modes, and the same numerical tolerances. Every numerical check passed. HENG was faster in 27 of 42 matrix comparisons, including 18 of 24 with fast mode enabled. The general `f64` contiguous fast workload won all six comparisons, with a speed ratio of 1.57 to 1.81 at 128 and 1.05 to 1.81 at 256. NumPy/OpenBLAS won all six general `f64` strict comparisons by factors of 1.87 to 5.62. For the 128 and 256 sizes respectively, HENG won 2 and 2 of 3 right-transposed runs, 3 and 1 of 3 both-transposed runs, and 3 and 1 of 3 fast `f32` runs. The exact binary-fraction profile won 2 and 2 of 3, and the affine profile won 3 and 2 of 3. The all-workload speed requirement failed.
+
+On the same 36-epoch character experiment, the fast-mode HENG training loop took 0.98154, 0.97549, and 0.87229 seconds. The paired NumPy times were 0.42127, 0.24952, and 0.24758 seconds. The NumPy speed ratio was 2.33 to 3.91. NumPy also led all three strict-mode runs by factors of 3.06 to 6.18. The same evaluation scores and greedy completions were reproduced. The held-out accuracy was 93.70%, and accuracy on the 14 unseen context-and-target pairs was 71.43%.
+
+#### Original character model training
 
 Run `python -B benchmarks/train_text_model.py --numpy --heng-matmul fast`. Use `--heng-matmul strict` to repeat with compensated accumulation. The model uses a 12-character context, one 64-unit hidden layer, 17,557 parameters, and Adam with a batch size of 32. It trained on 12 locally generated sentences for 36 epochs and 432 updates. Four sentence combinations were held out. They contain 127 next-character targets, including 14 context-and-target pairs absent from training. The NumPy baseline used the same model, initialization, batches, optimizer, and verified one-thread configuration as HENG.
 
@@ -223,7 +233,7 @@ HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置�
 
 运行 `python -B benchmarks/compare_frameworks.py --input rational --dtype f64 --layout contiguous --matmul-fast`。把 `--dtype` 改为 `f32` 可测试单精度。把 `--layout` 设为 `right-transposed` 或 `both-transposed`，可在保持逻辑输入值一致的前提下改变物理布局。省略 `--matmul-fast` 即使用默认补偿累加。符合条件的 `f64` 矩阵支持连续与转置存储布局的打包内核。`f32` 快速内核要求行主序连续矩阵，并在 `f32` 中累加。布局或累加安全界不符合条件时沿用原有路径。快速模式可能产生舍入差异。
 
-最终运行时复测三轮，沿用同版本 NumPy/OpenBLAS、同样的每轮样本数和经过核验的单计算线程配置。以下速度比用 NumPy 耗时除以 HENG 耗时，大于 1 表示 HENG 领先。
+上一版运行时的三轮测量沿用同版本 NumPy/OpenBLAS、同样的每轮样本数和经过核验的单计算线程配置。以下速度比用 NumPy 耗时除以 HENG 耗时，大于 1 表示 HENG 领先。
 
 - 快速 `f64`，连续布局：128 三轮均领先，速度比为 1.35 至 1.79。256 的速度比为 0.98、1.04、1.81。
 - 快速 `f64`，右矩阵转置存储：128 和 256 均三轮领先，速度比分别为 1.23 至 1.77、1.07 至 1.68。
@@ -233,7 +243,17 @@ HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置�
 
 所有样本均通过独立参考校验。HENG 在 `f64` 快速模式中的最大样本绝对误差为 `5.56e-16`，`f32` 快速模式为 `2.80e-7`。各轮计时存在波动，256 规模尤为明显。
 
-#### 字符模型训练
+#### 逐项性能验收
+
+矩阵比较程序可加 `--require-win`，要求核验单线程配置，并且 HENG 在每个选择的规模和比较库上中位耗时都严格更低。持平、落后或线程未核实均会使程序返回失败。训练程序支持 `--numpy --require-win`，同时要求评估指标及续写一致。性能验收失败时，两种程序仍保留实测数据。
+
+本轮运行时以向量分块打包转置矩阵，并在补偿累加中同时计算更多独立输出。快速模式可在左矩阵稀疏且右矩阵连续时跳过零系数。优化后的 Adam 与 AdamW 路径把双精度动量和参数更新合到一次遍历。反向自动微分复用已核验的图遍历结果，并按需初始化梯度存储。
+
+本轮沿用原有两种矩阵规模、输入分布、精度模式和误差容限，串行完成三轮测量。所有数值校验均通过。42 次矩阵配对中 HENG 领先 27 次，其中 24 次快速模式配对中领先 18 次。一般 `f64` 连续布局在快速模式下六次全胜，128 规模速度比为 1.57 至 1.81，256 规模为 1.05 至 1.81。一般 `f64` 严格模式六次均由 NumPy/OpenBLAS 领先，差距为 1.87 至 5.62 倍。按 128、256 的顺序，右矩阵转置存储分别领先 2 轮、2 轮，双矩阵转置存储领先 3 轮、1 轮，快速 `f32` 领先 3 轮、1 轮。精确二进制分数输入领先 2 轮、2 轮，仿射输入领先 3 轮、2 轮。全部用例严格领先的验收未通过。
+
+相同的 36 轮字符模型训练中，HENG 快速模式依次用时 0.98154、0.97549、0.87229 秒，NumPy 配对用时为 0.42127、0.24952、0.24758 秒。NumPy 的速度是 HENG 的 2.33 至 3.91 倍。严格模式下 NumPy 也三轮领先，速度为 HENG 的 3.06 至 6.18 倍。复测得到相同的评估指标和贪心续写。完整留出集准确率为 93.70%，14 个未见上下文与目标字符组合的准确率为 71.43%。
+
+#### 原字符模型训练实验
 
 运行 `python -B benchmarks/train_text_model.py --numpy --heng-matmul fast`。用 `--heng-matmul strict` 可以在补偿累加模式下复测。模型使用 12 字符上下文、64 个隐藏单元和 17,557 个参数，Adam 优化的批大小为 32。用 12 句本地合成语料训练 36 轮，共更新 432 步。留出 4 种完整句子组合，共 127 个下一字符目标。其中有 14 个上下文与目标字符的组合在训练中未出现。NumPy 与 HENG 采用相同的模型、初始化、批次和优化器，并核验单线程配置。
 
