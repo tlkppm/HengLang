@@ -130,6 +130,8 @@ The generated sentences were `the fox rests near stone walls.`, `the owl waits n
 
 The two fast-mode training loops took 1.95265 and 1.33276 seconds in HENG, versus 0.36633 and 0.26770 seconds in NumPy. The strict-mode run took 1.57613 seconds in HENG and 0.28343 seconds in NumPy. NumPy ran about 5.0 to 5.6 times as fast in these paired measurements. Timing includes batch extraction, forward and backward passes, and updates. Build, data preparation, evaluation, and generation are outside the timed interval.
 
+The optional `--native-step` mode uses a dedicated native kernel for this exact two-layer character model. It performs the same forward, cross-entropy gradient, and Adam update equations without recording a general-purpose graph. It is a workload-specific optimization, so its timing is reported separately from the general framework path. One matched run of `python -B benchmarks/train_text_model.py --numpy --heng-matmul fast --native-step` took 0.55237 seconds in the HENG path, while the paired NumPy run took 0.43020 seconds. The numerical metrics and generated text matched. The strict performance requirement returned `FAIL` because the specialized path was still slower than NumPy.
+
 #### Limits and reproduction
 
 The test-device details are withheld for privacy, which limits reproduction against a fully specified hardware configuration. CPU frequency, temperature, background load, process scheduling, allocator behavior, and language-call overhead were not normalized. No statistical confidence interval was calculated. The three deterministic input profiles cover specific distributions, sizes, and layouts. Multi-thread scaling, convolution, attention, large-corpus training, inference throughput, and energy use remain outside these comparisons.
@@ -265,6 +267,8 @@ HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置�
 生成的句子为 `the fox rests near stone walls.`、`the owl waits near old oaks.` 和 `the hare hides near still ponds.`。三句均出现在训练集。留出集指标反映模型在这个小语料上对已知词语新组合的预测效果。
 
 两轮快速模式训练循环中，HENG 分别用时 1.95265 和 1.33276 秒，NumPy 分别用时 0.36633 和 0.26770 秒。严格模式一轮中，HENG 用时 1.57613 秒，NumPy 用时 0.28343 秒。在这些配对测量中，NumPy 的训练速度约为 HENG 的 5.0 至 5.6 倍。计时包含批次提取、前向、反向及参数更新。构建、数据准备、评估和生成在计时区间外。
+
+可选的 `--native-step` 模式为这个特定的两层字符模型使用专用原生内核。它执行相同的前向、交叉熵梯度和 Adam 更新公式，但不记录通用计算图。这属于针对单一负载的优化，因此耗时与通用框架路径分开报告。一次运行 `python -B benchmarks/train_text_model.py --numpy --heng-matmul fast --native-step` 时，HENG 用时 0.55237 秒，配对的 NumPy 用时 0.43020 秒。数值指标和生成文本一致。严格性能验收返回 `FAIL`，因为这条专用路径仍慢于 NumPy。
 
 #### 限制与复现
 

@@ -970,6 +970,124 @@ static int tensor_unary_float(const char *name,HObject *source,HObject *output,d
 #ifdef __clang__
 #pragma STDC FP_CONTRACT OFF
 #endif
+static HObject *text_list_tensor(HObject *list,int64_t index){
+    if(index<0||index>=(int64_t)list->as.list.count)hv_fail("文本模型参数列表索引越界");
+    return require(list->as.list.items[index],H_TENSOR);
+}
+static int text_tensor_shape(HObject *tensor,int64_t rank,const int64_t *shape){
+    if(tensor_dtype(tensor)!=D_F64||tensor->as.tensor.rank!=rank||!tensor_contiguous(tensor))return 0;
+    for(int64_t axis=0;axis<rank;axis++)if(tensor->as.tensor.shape[axis]!=shape[axis])return 0;
+    return 1;
+}
+__attribute__((target("avx,fma")))
+static HValue text_adam_step_f64(HValue *arguments){
+    HObject *parameters=require(arguments[0],H_LIST);
+    HObject *first_values=require(arguments[1],H_LIST);
+    HObject *second_values=require(arguments[2],H_LIST);
+    HObject *input=require(arguments[3],H_TENSOR),*target=require(arguments[4],H_TENSOR);
+    if(parameters->as.list.count!=4||first_values->as.list.count!=4||second_values->as.list.count!=4)return hv_list(0,NULL);
+    if(tensor_dtype(input)!=D_F64||tensor_dtype(target)!=D_F64||input->as.tensor.rank!=2||target->as.tensor.rank!=1||!tensor_contiguous(input)||!tensor_contiguous(target))return hv_list(0,NULL);
+    int64_t batch=input->as.tensor.shape[0],input_width=input->as.tensor.shape[1];
+    int64_t hidden_width=text_list_tensor(parameters,1)->as.tensor.shape[0];
+    int64_t vocabulary=text_list_tensor(parameters,3)->as.tensor.shape[0];
+    int64_t w1_shape[2]={input_width,hidden_width},b_shape[1]={hidden_width},w2_shape[2]={hidden_width,vocabulary},o_shape[1]={vocabulary};
+    HObject *w1=text_list_tensor(parameters,0),*b1=text_list_tensor(parameters,1),*w2=text_list_tensor(parameters,2),*b2=text_list_tensor(parameters,3);
+    if(!text_tensor_shape(w1,2,w1_shape)||!text_tensor_shape(b1,1,b_shape)||!text_tensor_shape(w2,2,w2_shape)||!text_tensor_shape(b2,1,o_shape)||target->as.tensor.shape[0]!=batch||batch<=0)return hv_list(0,NULL);
+    const double *input_data=input->as.tensor.storage->as.storage.data,*target_data=target->as.tensor.storage->as.storage.data;
+    const double *w1_data=w1->as.tensor.storage->as.storage.data,*b1_data=b1->as.tensor.storage->as.storage.data,*w2_data=w2->as.tensor.storage->as.storage.data,*b2_data=b2->as.tensor.storage->as.storage.data;
+    HValue gradients[4]={tensor_allocate(2,w1_shape,D_F64,1),tensor_allocate(1,b_shape,D_F64,1),tensor_allocate(2,w2_shape,D_F64,1),tensor_allocate(1,o_shape,D_F64,1)};
+    double *g1=gradients[0].as.obj->as.tensor.storage->as.storage.data,*gb1=gradients[1].as.obj->as.tensor.storage->as.storage.data,*g2=gradients[2].as.obj->as.tensor.storage->as.storage.data,*gb2=gradients[3].as.obj->as.tensor.storage->as.storage.data;
+    double *hidden=allocate(checked_size((size_t)hidden_width,sizeof(double))),*logits=allocate(checked_size((size_t)vocabulary,sizeof(double))),*delta=allocate(checked_size((size_t)vocabulary,sizeof(double))),*hidden_delta=allocate(checked_size((size_t)hidden_width,sizeof(double)));
+    for(int64_t row=0;row<batch;row++){
+        const double *input_row=input_data+row*input_width;
+        for(int64_t h=0;h<hidden_width;h++)hidden[h]=b1_data[h];
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+        if(matmul_has_fma()){
+            for(int64_t i=0;i<input_width;i++){
+                __m256d input_value=_mm256_set1_pd(input_row[i]);
+                int64_t h=0;
+                for(;hidden_width-h>=4;h+=4){
+                    __m256d accum=_mm256_loadu_pd(hidden+h),weights=_mm256_loadu_pd(w1_data+i*hidden_width+h);
+                    _mm256_storeu_pd(hidden+h,_mm256_fmadd_pd(input_value,weights,accum));
+                }
+                for(;h<hidden_width;h++)hidden[h]+=input_row[i]*w1_data[i*hidden_width+h];
+            }
+        }else
+#endif
+        for(int64_t h=0;h<hidden_width;h++){
+            double total=b1_data[h];
+            for(int64_t i=0;i<input_width;i++)total+=input_row[i]*w1_data[i*hidden_width+h];
+            hidden[h]=total;
+        }
+        for(int64_t h=0;h<hidden_width;h++)hidden[h]=tanh(hidden[h]);
+        for(int64_t v=0;v<vocabulary;v++)logits[v]=b2_data[v];
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+        if(matmul_has_fma()){
+            for(int64_t h=0;h<hidden_width;h++){
+                __m256d hidden_value=_mm256_set1_pd(hidden[h]);
+                int64_t v=0;
+                for(;vocabulary-v>=4;v+=4){
+                    __m256d accum=_mm256_loadu_pd(logits+v),weights=_mm256_loadu_pd(w2_data+h*vocabulary+v);
+                    _mm256_storeu_pd(logits+v,_mm256_fmadd_pd(hidden_value,weights,accum));
+                }
+                for(;v<vocabulary;v++)logits[v]+=hidden[h]*w2_data[h*vocabulary+v];
+            }
+        }else
+#endif
+        for(int64_t v=0;v<vocabulary;v++){
+            double total=b2_data[v];
+            for(int64_t h=0;h<hidden_width;h++)total+=hidden[h]*w2_data[h*vocabulary+v];
+            logits[v]=total;
+        }
+        double maximum=-INFINITY;
+        for(int64_t v=0;v<vocabulary;v++)if(logits[v]>maximum)maximum=logits[v];
+        double normalization=0;for(int64_t v=0;v<vocabulary;v++){delta[v]=exp(logits[v]-maximum);normalization+=delta[v];}
+        int64_t label=(int64_t)target_data[row];if(label<0||label>=vocabulary)hv_fail("文本模型标签越界");
+        for(int64_t v=0;v<vocabulary;v++){delta[v]=delta[v]/normalization-(v==label);gb2[v]+=delta[v];}
+        for(int64_t h=0;h<hidden_width;h++){
+            double total=0;
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+            if(matmul_has_fma()){
+                int64_t v=0;
+                __m256d hidden_value=_mm256_set1_pd(hidden[h]);
+                __m256d sum=_mm256_setzero_pd();
+                for(;vocabulary-v>=4;v+=4){
+                    __m256d delta_values=_mm256_loadu_pd(delta+v),weights=_mm256_loadu_pd(w2_data+h*vocabulary+v);
+                    sum=_mm256_add_pd(sum,_mm256_mul_pd(delta_values,weights));
+                    _mm256_storeu_pd(g2+h*vocabulary+v,_mm256_add_pd(_mm256_loadu_pd(g2+h*vocabulary+v),_mm256_mul_pd(hidden_value,delta_values)));
+                }
+                double partial[4];_mm256_storeu_pd(partial,sum);total=partial[0]+partial[1]+partial[2]+partial[3];
+                for(;v<vocabulary;v++){g2[h*vocabulary+v]+=hidden[h]*delta[v];total+=delta[v]*w2_data[h*vocabulary+v];}
+            }else
+#endif
+            {for(int64_t v=0;v<vocabulary;v++){g2[h*vocabulary+v]+=hidden[h]*delta[v];total+=delta[v]*w2_data[h*vocabulary+v];}}
+            hidden_delta[h]=total*(1.0-hidden[h]*hidden[h]);gb1[h]+=hidden_delta[h];
+        }
+        for(int64_t i=0;i<input_width;i++){
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+            if(matmul_has_fma()){
+                __m256d input_value=_mm256_set1_pd(input_row[i]);int64_t h=0;
+                for(;hidden_width-h>=4;h+=4){__m256d gradient=_mm256_loadu_pd(g1+i*hidden_width+h),hidden_gradient=_mm256_loadu_pd(hidden_delta+h);_mm256_storeu_pd(g1+i*hidden_width+h,_mm256_add_pd(gradient,_mm256_mul_pd(input_value,hidden_gradient)));}
+                for(;h<hidden_width;h++)g1[i*hidden_width+h]+=input_row[i]*hidden_delta[h];
+            }else
+#endif
+            for(int64_t h=0;h<hidden_width;h++)g1[i*hidden_width+h]+=input_row[i]*hidden_delta[h];
+        }
+    }
+    release(hidden);release(logits);release(delta);release(hidden_delta);
+    double beta1=hv_number(arguments[5]),beta2=hv_number(arguments[6]),first_correction=hv_number(arguments[7]),second_correction=hv_number(arguments[8]),epsilon=hv_number(arguments[9]),rate=hv_number(arguments[10]),decay=hv_number(arguments[11]);
+    const double *gradient_data[4]={g1,gb1,g2,gb2};
+    HValue output[4];
+    for(int index=0;index<4;index++){
+        HObject *parameter=text_list_tensor(parameters,index),*moment_first=text_list_tensor(first_values,index),*moment_second=text_list_tensor(second_values,index);
+        HValue next=tensor_allocate(parameter->as.tensor.rank,parameter->as.tensor.shape,D_F64,0),next_first=tensor_allocate(parameter->as.tensor.rank,parameter->as.tensor.shape,D_F64,0),next_second=tensor_allocate(parameter->as.tensor.rank,parameter->as.tensor.shape,D_F64,0);
+        const double *weights=parameter->as.tensor.storage->as.storage.data,*old_first=moment_first->as.tensor.storage->as.storage.data,*old_second=moment_second->as.tensor.storage->as.storage.data;double *weights_next=next.as.obj->as.tensor.storage->as.storage.data,*first_next=next_first.as.obj->as.tensor.storage->as.storage.data,*second_next=next_second.as.obj->as.tensor.storage->as.storage.data;
+        for(int64_t item=0;item<parameter->as.tensor.count;item++){double grad=gradient_data[index][item]/(double)batch,first_value=old_first[item]*beta1+grad*(1.0-beta1),second_value=old_second[item]*beta2+grad*grad*(1.0-beta2),update=first_value*first_correction/(sqrt(second_value*second_correction)+epsilon),updated=weights[item]-rate*update;weights_next[item]=decay>0?updated-rate*decay*weights[item]:updated;first_next[item]=first_value;second_next[item]=second_value;}
+        first_values->as.list.items[index]=next_first;second_values->as.list.items[index]=next_second;output[index]=next;
+    }
+    return hv_list(4,output);
+}
+
 static HValue tensor_adam_f64(HValue *arguments){
     HObject *value=require(arguments[0],H_TENSOR);
     const double *inputs[4];
@@ -1016,7 +1134,7 @@ static const BuiltinSignature signatures[]={
     {"tensor",2},{"zeros",1},{"ones",1},{"full",2},{"arange",1},{"rand",1},{"randn",1},{"seed",1},{"rng_state",0},{"rng_restore",1},{"shape",1},{"rank",1},{"numel",1},{"dtype",1},{"cast",2},{"item",2},{"get",2},{"set",3},{"tensor_version",1},{"clone",1},
     {"add",2},{"sub",2},{"mul",2},{"div",2},{"scale",2},{"pow",2},{"exp",1},{"log",1},{"sqrt",1},{"tanh",1},{"sigmoid",1},{"relu",1},{"abs",1},{"sign",1},{"greater",2},{"equal",2},
     {"reshape",2},{"transpose",2},{"slice",5},{"concat",3},{"gather",3},{"scatter_add",4},{"broadcast_to",2},{"reduce_to_shape",2},{"sum",3},{"sum_all",1},{"mean",3},{"max",3},{"argmax",2},{"matmul",2},{"softmax",2},{"unfold2d",5},{"fold2d",6},
-    {"coo",5},{"csr",5},{"sparse_dense",1},{"sparse_matmul",2},{"sparse_transpose",1},{"set_threads",1},{"get_threads",0},{"set_optimized",1},{"set_matmul_fast",1},{"adam_f64",11},{"fused_affine_relu",3},{"gc_collect",0},{"live_objects",0},{"memory_bytes",0},{"peak_memory_bytes",0},{"allocation_count",0},{"buffer_reuse_count",0},{"cached_memory_bytes",0},{"system_allocation_count",0},{"trim_buffers",0},{"clock",0},{"state_save",4},{"state_tensors",1},{"state_ints",1},{"state_floats",1}
+    {"coo",5},{"csr",5},{"sparse_dense",1},{"sparse_matmul",2},{"sparse_transpose",1},{"set_threads",1},{"get_threads",0},{"set_optimized",1},{"set_matmul_fast",1},{"adam_f64",11},{"text_adam_step_f64",12},{"fused_affine_relu",3},{"gc_collect",0},{"live_objects",0},{"memory_bytes",0},{"peak_memory_bytes",0},{"allocation_count",0},{"buffer_reuse_count",0},{"cached_memory_bytes",0},{"system_allocation_count",0},{"trim_buffers",0},{"clock",0},{"state_save",4},{"state_tensors",1},{"state_ints",1},{"state_floats",1}
 };
 HValue hv_native(const char *name,int64_t count,HValue *arguments){if(!name||count<0||(count&&!arguments))hv_fail("内置调用参数无效");int found=0;for(size_t index=0;index<sizeof(signatures)/sizeof(signatures[0]);index++)if(!strcmp(name,signatures[index].name)){found=1;if(count!=signatures[index].count)hv_fail("内置参数数量不匹配");break;}if(!found)hv_fail("未知内置函数");HFrame frame;hv_frame_push(&frame,arguments,(size_t)count);HValue result=native_dispatch(name,count,arguments);hv_frame_pop(&frame);return result;}
 static HValue native_dispatch(const char *name,int64_t count,HValue *arguments){
@@ -1054,6 +1172,7 @@ static HValue native_dispatch(const char *name,int64_t count,HValue *arguments){
     if(!strcmp(name,"set_optimized")){optimized=hv_truth(arguments[0]);return hv_void();}
     if(!strcmp(name,"set_matmul_fast")){matmul_fast=hv_truth(arguments[0]);return hv_void();}
     if(!strcmp(name,"adam_f64"))return tensor_adam_f64(arguments);
+    if(!strcmp(name,"text_adam_step_f64"))return text_adam_step_f64(arguments);
     if(!strcmp(name,"seed")){int64_t seed=hv_integer(arguments[0]);memcpy(&rng,&seed,8);if(!rng)rng=UINT64_C(88172645463325252);return hv_void();}
     if(!strcmp(name,"rng_state")){int64_t state;memcpy(&state,&rng,8);return hv_i64(state);}
     if(!strcmp(name,"rng_restore")){int64_t state=hv_integer(arguments[0]);if(!state)hv_fail("随机数状态不能为零");memcpy(&rng,&state,8);return hv_void();}

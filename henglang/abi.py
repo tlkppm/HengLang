@@ -80,6 +80,7 @@ BUILTINS: dict[str, tuple[list[str], str]] = {
     "set_optimized": (["bool"], "void"),
     "set_matmul_fast": (["bool"], "void"),
     "adam_f64": (["Tensor", "Tensor", "Tensor", "Tensor", "f64", "f64", "f64", "f64", "f64", "f64", "f64"], "List<Tensor>"),
+    "text_adam_step_f64": (["List<Tensor>", "List<Tensor>", "List<Tensor>", "Tensor", "Tensor", "f64", "f64", "f64", "f64", "f64", "f64", "f64"], "List<Tensor>"),
     "fused_affine_relu": (["Tensor", "f64", "f64"], "Tensor"),
     "gc_collect": ([], "void"),
     "live_objects": ([], "i64"),

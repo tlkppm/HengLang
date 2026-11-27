@@ -27,6 +27,18 @@ class TextModelTests(unittest.TestCase):
                 parse_arguments(invalid)
         self.assertTrue(parse_arguments(["--require-win", "--numpy"]).require_win)
 
+    def test_native_step_smoke_trains_and_reports_unseen_examples(self):
+        result = subprocess.run(
+            [sys.executable, "-B", str(ROOT / "benchmarks" / "train_text_model.py"), "--smoke", "--native-step"],
+            cwd=ROOT, capture_output=True, encoding="utf-8", timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["configuration"]["native_step"])
+        self.assertEqual(report["privacy"], {"machine_information": "omitted"})
+        self.assertTrue(report["results"]["heng"]["single_thread_verified"])
+        self.assertLess(report["results"]["heng"]["final"]["validation"]["loss"], 3.1)
+
     def test_native_smoke_trains_and_reports_unseen_examples(self):
         result = subprocess.run(
             [sys.executable, "-B", str(ROOT / "benchmarks" / "train_text_model.py"), "--smoke"],

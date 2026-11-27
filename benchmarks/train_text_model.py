@@ -38,6 +38,7 @@ def parse_arguments(arguments):
     extent.add_argument("--smoke", action="store_true", help="执行一轮训练和生成，不调用训练计时器")
     parser.add_argument("--numpy", action="store_true", help="在 HENG 之后串行运行 NumPy 手写基线")
     parser.add_argument("--require-win", action="store_true", help="要求模型指标与续写一致，且 HENG 在核实单线程后严格更快")
+    parser.add_argument("--native-step", action="store_true", help="使用字符模型专用原生训练步，保留通用自动微分默认路径")
     parser.add_argument("--heng-matmul", choices=("default", "strict", "fast"), default="default",
                         help="strict 或 fast 通过 set_matmul_fast 显式切换路径，默认沿用运行时设置")
     parser.add_argument("--timeout", type=float, default=120.0, help="HENG 程序执行超时秒数")
@@ -78,6 +79,7 @@ def model_configuration(vocabulary, args):
         "epsilon": 0.00000001,
         "generation_length": 48,
         "timed": not args.smoke,
+        "native_step": args.native_step,
     }
 
 

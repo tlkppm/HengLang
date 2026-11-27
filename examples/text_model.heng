@@ -17,7 +17,8 @@ struct TextModelConfig {
     beta2: f64,
     epsilon: f64,
     generation_length: i64,
-    timed: bool
+    timed: bool,
+    native_step: bool
 }
 
 struct TextModelDataset {
@@ -97,7 +98,38 @@ fn text_model_metrics(tape: AGTape, parameters: List<i64>, dataset: TextModelDat
     let restored = ag_set_enabled(tape, previous);
 }
 
+fn text_model_train_native(tape: AGTape, parameters: List<i64>, dataset: TextModelDataset, config: TextModelConfig) -> f64 {
+    let optimizer = opt_adam(tape, parameters, config.learning_rate, config.beta1, config.beta2, config.epsilon, 0.0);
+    let values: List<Tensor> = [];
+    for parameter in parameters { push(values, ag_value(tape, parameter)); }
+    let loader = data_loader(dataset.inputs, dataset.targets, config.batch_size, true, false, config.shuffle_seed);
+    var start = 0.0;
+    if config.timed { start = clock(); }
+    var epoch: i64 = 0;
+    while epoch < config.epochs {
+        if epoch > 0 { data_begin_epoch(loader); }
+        while data_has_next(loader) {
+            let batch = data_next(loader);
+            optimizer.steps=optimizer.steps+1;
+            let first_correction=1.0/(1.0-opt_scalar_power(optimizer.beta1,optimizer.steps));
+            let second_correction=1.0/(1.0-opt_scalar_power(optimizer.beta2,optimizer.steps));
+            let updated=text_adam_step_f64(values,optimizer.first,optimizer.second,batch.inputs,batch.targets,optimizer.beta1,optimizer.beta2,first_correction,second_correction,optimizer.epsilon,optimizer.learning_rate,0.0);
+            assert(len(updated)==len(parameters),"原生文本训练更新数量错误");
+            var index:i64=0;
+            for parameter in parameters {
+                values[index]=updated[index];
+                ag_assign(tape,parameter,updated[index]);
+                index=index+1;
+            }
+        }
+        epoch += 1;
+    }
+    if config.timed { return clock() - start; }
+    return 0.0;
+}
+
 fn text_model_train(tape: AGTape, parameters: List<i64>, dataset: TextModelDataset, config: TextModelConfig) -> f64 {
+    if config.native_step { return text_model_train_native(tape, parameters, dataset, config); }
     let optimizer = opt_adam(tape, parameters, config.learning_rate, config.beta1, config.beta2, config.epsilon, 0.0);
     let loader = data_loader(dataset.inputs, dataset.targets, config.batch_size, true, false, config.shuffle_seed);
     var start = 0.0;
