@@ -12,7 +12,7 @@ from henglang.__main__ import ROOT
 
 class SourcePolicyTests(unittest.TestCase):
     def sources(self):
-        for directory in ["henglang", "runtime", "heng", "tools", "tests", "benchmarks", "examples"]:
+        for directory in ["henglang", "runtime", "heng", "tools", "tests", "benchmarks", "examples", "experiments"]:
             for path in sorted((ROOT / directory).rglob("*")):
                 if path.is_file() and path.suffix in {".py", ".c", ".h", ".heng"}:
                     yield path

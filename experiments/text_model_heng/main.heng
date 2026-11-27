@@ -1,0 +1,78 @@
+import "../../heng/heng.heng";
+
+fn text_inputs(values:List<i64>)->Tensor {
+    let encoded:List<f64>=[];
+    for value in values { push(encoded,f64(value)); }
+    return tensor(encoded,[len(values)]);
+}
+
+fn text_labels(values:List<i64>)->List<i64> {
+    let labels:List<i64>=[];
+    for value in values { push(labels,value); }
+    return labels;
+}
+
+fn text_score(tape:AGTape,model:NNModule,parameters:List<i64>,inputs:Tensor,labels:List<i64>) {
+    let previous=ag_set_enabled(tape,false);
+    let input=ag_constant(tape,inputs);
+    let logits=nn_forward(tape,model,input);
+    let loss=nn_cross_entropy(tape,logits,labels);
+    let predictions=argmax(ag_value(tape,logits),1);
+    var correct:i64=0;
+    var index:i64=0;
+    for label in labels {
+        if i64(item(predictions,index))==label { correct=correct+1; }
+        index=index+1;
+    }
+    print(item(ag_value(tape,loss),0));
+    print(f64(correct)/f64(len(labels)));
+    ag_clear_graph(tape,parameters);
+    let restored=ag_set_enabled(tape,previous);
+}
+
+fn text_generate(tape:AGTape,model:NNModule,parameters:List<i64>,start:i64,steps:i64)->List<i64> {
+    let previous=ag_set_enabled(tape,false);
+    let output:List<i64>=[];
+    var token=start;
+    var index:i64=0;
+    while index<steps {
+        let input=ag_constant(tape,tensor([f64(token)],[1]));
+        let logits=nn_forward(tape,model,input);
+        let next=i64(item(argmax(ag_value(tape,logits),1),0));
+        push(output,next);
+        token=next;
+        ag_clear_graph(tape,parameters);
+        index=index+1;
+    }
+    let restored=ag_set_enabled(tape,previous);
+    return output;
+}
+
+fn main()->void {
+    set_threads(1);
+    set_optimized(true);
+    let inputs=text_inputs([0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3]);
+    let labels=text_labels([1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4]);
+    let tape=ag_tape();
+    let model=nn_sequential();
+    nn_add(model,nn_embedding(tape,5,8));
+    nn_add(model,nn_linear(tape,8,5,true));
+    let parameters=nn_parameters(model);
+    let optimizer=opt_adam(tape,parameters,0.05,0.9,0.999,0.00000001,0.0);
+    print("HENG_ONLY_TEXT_MODEL_V1");
+    text_score(tape,model,parameters,inputs,labels);
+    var epoch:i64=0;
+    while epoch<80 {
+        opt_zero_grad(tape,optimizer);
+        let input=ag_variable(tape,inputs,false);
+        let logits=nn_forward(tape,model,input);
+        let loss=nn_cross_entropy(tape,logits,labels);
+        ag_backward(tape,loss,ones([]),false);
+        opt_step(tape,optimizer);
+        ag_clear_graph(tape,parameters);
+        epoch=epoch+1;
+    }
+    text_score(tape,model,parameters,inputs,labels);
+    print(text_generate(tape,model,parameters,0,12));
+    print("HENG_ONLY_TEXT_MODEL_END_V1");
+}
