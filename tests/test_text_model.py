@@ -26,6 +26,9 @@ class TextModelTests(unittest.TestCase):
             with self.subTest(arguments=invalid), self.assertRaises(ExperimentError):
                 parse_arguments(invalid)
         self.assertTrue(parse_arguments(["--require-win", "--numpy"]).require_win)
+        self.assertEqual(parse_arguments(["--require-win", "--numpy"]).minimum_speedup, 1.10)
+        with self.assertRaises(ExperimentError):
+            parse_arguments(["--minimum-speedup", "0"])
 
     def test_native_step_smoke_trains_and_reports_unseen_examples(self):
         result = subprocess.run(

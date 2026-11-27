@@ -37,7 +37,8 @@ def parse_arguments(arguments):
     extent.add_argument("--epochs", type=int, help=f"训练轮数，默认 {DEFAULT_EPOCHS}，允许 1 至 100")
     extent.add_argument("--smoke", action="store_true", help="执行一轮训练和生成，不调用训练计时器")
     parser.add_argument("--numpy", action="store_true", help="在 HENG 之后串行运行 NumPy 手写基线")
-    parser.add_argument("--require-win", action="store_true", help="要求模型指标与续写一致，且 HENG 在核实单线程后严格更快")
+    parser.add_argument("--require-win", action="store_true", help="要求模型指标与续写一致，且 HENG 在核实单线程后至少快 10%%")
+    parser.add_argument("--minimum-speedup", type=float, default=1.10, help="严格训练验收要求的 NumPy/HENG 最低速度比，默认 1.10")
     parser.add_argument("--native-step", action="store_true", help="使用字符模型专用原生训练步，保留通用自动微分默认路径")
     parser.add_argument("--heng-matmul", choices=("default", "strict", "fast"), default="default",
                         help="strict 或 fast 通过 set_matmul_fast 显式切换路径，默认沿用运行时设置")
@@ -48,8 +49,8 @@ def parse_arguments(arguments):
         raise ExperimentError("--require-win 需要 NumPy 对照和正式训练计时")
     if args.epochs is not None and not 1 <= args.epochs <= 100:
         raise ExperimentError("训练轮数必须在 1 至 100 之间")
-    if not 0 < args.timeout <= args.build_timeout < math.inf:
-        raise ExperimentError("超时必须为有限正数，且总超时不得小于执行超时")
+    if not 0 < args.timeout <= args.build_timeout < math.inf or not math.isfinite(args.minimum_speedup) or args.minimum_speedup <= 0:
+        raise ExperimentError("超时和最低速度比必须为有限正数，且总超时不得小于执行超时")
     return args
 
 
@@ -332,7 +333,8 @@ def run(args):
         "configuration": {**config, "heng_matmul": args.heng_matmul, "requested_threads": 1,
                           "parameter_count": (config["context"] * len(vocabulary) + 1) * config["hidden"]
                                              + (config["hidden"] + 1) * len(vocabulary),
-                          "optimizer_steps": config["epochs"] * math.ceil(len(train_tokens) / config["batch_size"])},
+                          "optimizer_steps": config["epochs"] * math.ceil(len(train_tokens) / config["batch_size"]),
+                          "minimum_speedup": args.minimum_speedup},
         "data": {"source": "本地合成，四个句首与四个地点组合，按完整句子留出四个对角组合",
                  "train_sentences": len(train), "validation_sentences": len(validation),
                  "train_targets": len(train_tokens), "validation_targets": len(validation_tokens),
@@ -353,7 +355,7 @@ def run(args):
             report["status"] = "FAIL"
         if args.require_win:
             ratio = comparison["numpy_over_heng_training_time"]
-            passed = comparison["metrics_match"] and comparison["generations_match"] and ratio is not None and ratio > 1.0
+            passed = comparison["metrics_match"] and comparison["generations_match"] and ratio is not None and ratio > args.minimum_speedup
             report["performance_requirement"] = "PASS" if passed else "FAIL"
             report["status"] = report["performance_requirement"]
     return report

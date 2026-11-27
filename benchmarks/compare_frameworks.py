@@ -43,7 +43,8 @@ def parse_arguments(arguments=None):
     parser.add_argument("--layout", choices=["contiguous", "right-transposed", "both-transposed"], default="contiguous", help="保持输入值不变，切换矩阵物理存储布局")
     parser.add_argument("--dtype", choices=["f64", "f32"], default="f64", help="矩阵和结果的数据类型")
     parser.add_argument("--matmul-fast", action="store_true", help="HENG 对满足条件的浮点矩阵使用融合乘加，允许舍入差异")
-    parser.add_argument("--require-win", action="store_true", help="要求核实单线程且 HENG 在每个所选规模均严格更快")
+    parser.add_argument("--require-win", action="store_true", help="要求核实单线程且 HENG 在每个所选规模至少快 10%%")
+    parser.add_argument("--minimum-speedup", type=float, default=1.10, help="严格验收要求的 NumPy/HENG 最低速度比，默认 1.10")
     parser.add_argument("--warmup", type=int, default=3, help="预热次数，至少 3")
     parser.add_argument("--repeats", type=int, default=20, help="计时次数，至少 20，取中位数")
     parser.add_argument("--frameworks", choices=["numpy", "torch"], nargs="+", default=["numpy"], help="仅使用已安装的框架，默认 numpy；torch 为可选项")
@@ -51,8 +52,8 @@ def parse_arguments(arguments=None):
     parser.add_argument("--build-timeout", type=float, default=300.0, help="每次 HENG 构建及执行的总超时秒数")
     args = parser.parse_args(arguments)
     validate_configuration(args.sizes, args.warmup, args.repeats)
-    if not all(math.isfinite(value) and value > 0 for value in (args.timeout, args.build_timeout)):
-        raise BenchmarkError("超时必须是有限正数")
+    if not all(math.isfinite(value) and value > 0 for value in (args.timeout, args.build_timeout, args.minimum_speedup)):
+        raise BenchmarkError("超时和最低速度比必须是有限正数")
     if args.build_timeout < args.timeout:
         raise BenchmarkError("构建及执行总超时不得小于执行超时")
     if len(set(args.frameworks)) != len(args.frameworks):
@@ -483,7 +484,7 @@ def run(args):
         "parameters": {"sizes": args.sizes, "dtype": args.dtype, "device": "cpu", "warmup": args.warmup,
                        "input_profile": args.input, "input_layout": args.layout, "heng_matmul_fast": args.matmul_fast,
                        "repeats": args.repeats, "statistic": "median", "requested_threads": 1,
-                       "timeout_seconds": args.timeout, "build_and_run_timeout_seconds": args.build_timeout},
+                       "timeout_seconds": args.timeout, "build_and_run_timeout_seconds": args.build_timeout, "minimum_speedup": args.minimum_speedup},
         "method": {"operation": "C = matmul(A, B)，每次调用创建新输出，不使用 out 参数",
                    "inputs": {"affine": "i = arange(n*n), A = reshape(i*(1/(n*n))-0.5), B = reshape(i*(-0.75/(n*n))+0.25)",
                               "dyadic": "展平索引的整数同余序列除以 65536，得到可精确表示的二进制有理数",
@@ -521,9 +522,9 @@ def run(args):
     if args.require_win:
         failures = [{"shape": row["shape"], "framework": name, "ratio": result["ratio_framework_over_heng"]}
                     for row in report["results"] for name, result in row["frameworks"].items()
-                    if result["ratio_framework_over_heng"] <= 1.0]
+                    if result["ratio_framework_over_heng"] <= args.minimum_speedup]
         passed = report["fair_single_thread"] and not failures
-        report["performance_requirement"] = {"status": "PASS" if passed else "FAIL", "non_wins": failures}
+        report["performance_requirement"] = {"status": "PASS" if passed else "FAIL", "minimum_speedup": args.minimum_speedup, "non_wins": failures}
         report["status"] = report["performance_requirement"]["status"]
     return report
 

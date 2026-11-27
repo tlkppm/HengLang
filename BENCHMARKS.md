@@ -109,7 +109,7 @@ Every sampled result passed the independent reference check. The largest observe
 
 #### Per-workload performance requirement
 
-Add `--require-win` to the matrix driver to require verified single-thread settings and a strictly lower HENG median for every selected matrix size and library. A tie, a slower result, or unverified threads makes the command fail. The training driver accepts `--numpy --require-win` and also requires matching evaluation scores and generated text. Both commands retain the measured results when the speed requirement fails.
+Add `--require-win` to the matrix driver to require verified single-thread settings and a strictly greater than `1.10` NumPy/HENG median ratio for every selected matrix size and library. The default requirement is a 10% lead. A tie, a smaller lead, a slower result, or unverified threads makes the command fail. Use `--minimum-speedup` to choose a different positive threshold. The training driver accepts `--numpy --require-win` and applies the same default 10% threshold while also requiring matching evaluation scores and generated text.
 
 The latest runtime packs transposed matrices in vector tiles and processes more independent outputs together during compensated accumulation. The optional fast mode can skip zero coefficients when the eligible left operand is sparse and the right operand is contiguous. The optimized Adam and AdamW path combines the double-precision moment updates and parameter update in one traversal. Reverse-mode differentiation reuses the validated graph traversal and initializes gradient storage as needed.
 
@@ -247,7 +247,7 @@ HENG 实际打印 `get_threads()` 返回值。源码检查确认，只有配置�
 
 #### 逐项性能验收
 
-矩阵比较程序可加 `--require-win`，要求核验单线程配置，并且 HENG 在每个选择的规模和比较库上中位耗时都严格更低。持平、落后或线程未核实均会使程序返回失败。训练程序支持 `--numpy --require-win`，同时要求评估指标及续写一致。性能验收失败时，两种程序仍保留实测数据。
+矩阵比较程序可加 `--require-win`，要求核验单线程配置，并且每个选择的规模和比较库中 NumPy/HENG 速度比严格大于 `1.10`。默认要求领先 10%。持平、领先不足 10%、落后或线程未核实均会使程序返回失败。可用 `--minimum-speedup` 选择其他正数阈值。训练程序支持 `--numpy --require-win`，同样默认要求领先 10%，并要求评估指标及续写一致。性能验收失败时，两种程序仍保留实测数据。
 
 本轮运行时以向量分块打包转置矩阵，并在补偿累加中同时计算更多独立输出。快速模式可在左矩阵稀疏且右矩阵连续时跳过零系数。优化后的 Adam 与 AdamW 路径把双精度动量和参数更新合到一次遍历。反向自动微分复用已核验的图遍历结果，并按需初始化梯度存储。
 

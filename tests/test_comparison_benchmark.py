@@ -48,7 +48,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         args = benchmark.parse_arguments(["--sizes", "3", "5", "--warmup", "4", "--repeats", "22", "--frameworks", "numpy", "torch"])
         self.assertEqual((args.sizes, args.warmup, args.repeats), ([3, 5], 4, 22))
         for arguments in (["--timeout", "nan"], ["--timeout", "0"], ["--build-timeout", "1"],
-                          ["--frameworks", "numpy", "numpy"], ["--sizes", "bad"], ["--unknown"]):
+                          ["--frameworks", "numpy", "numpy"], ["--sizes", "bad"], ["--minimum-speedup", "nan"], ["--minimum-speedup", "0"], ["--unknown"]):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(benchmark.BenchmarkError):
                     benchmark.parse_arguments(arguments)
@@ -319,7 +319,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
     def test_run_returns_sanitized_report_with_dynamic_thread_aggregation(self):
         args = benchmark.parse_arguments(["--sizes", "2", "--require-win"])
         module = types.SimpleNamespace(__version__="test-version")
-        for heng_verified, framework_verified, ratio in ((True, True, 2.0), (True, True, 1.0), (True, True, 0.5),
+        for heng_verified, framework_verified, ratio in ((True, True, 2.0), (True, True, 1.1), (True, True, 1.0), (True, True, 0.5),
                                                          (True, False, 2.0), (False, True, 2.0), (False, False, 2.0)):
             with self.subTest(heng=heng_verified, framework=framework_verified, ratio=ratio):
                 heng_timing = {"median_seconds": 1.0, "threads": {"verified": heng_verified}}
@@ -336,8 +336,8 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 self.assertEqual(report["fair_single_thread"], heng_verified and framework_verified)
                 self.assertIn("不保证 CPU 调度隔离", report["fair_single_thread_meaning"])
                 self.assertEqual(report["results"][0]["frameworks"]["numpy"]["ratio_framework_over_heng"], ratio)
-                self.assertEqual(report["status"], "PASS" if heng_verified and framework_verified and ratio > 1.0 else "FAIL")
-                self.assertEqual(len(report["performance_requirement"]["non_wins"]), int(ratio <= 1.0))
+                self.assertEqual(report["status"], "PASS" if heng_verified and framework_verified and ratio > 1.1 else "FAIL")
+                self.assertEqual(len(report["performance_requirement"]["non_wins"]), int(ratio <= 1.1))
                 self.assertIn("blas", report["versions"])
                 self.assertNotIn(str(ROOT), json.dumps(report))
                 temporary.__exit__.assert_called_once()
